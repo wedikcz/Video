@@ -34,7 +34,11 @@ import {
   InfraWorkflowRun,
   InfraWorkflowStep,
   LoraTrainingJob,
+  McpAuditEntry,
+  McpEndpointRecord,
   McpToolDefinition,
+  McpTransportType,
+  SelfHealingEvent,
   ServerlessEndpoint,
 } from '../types/nexus.ts';
 import { copyTextSafely } from '../utils/clipboard.ts';
@@ -136,13 +140,28 @@ export const InfraCloudView: React.FC = () => {
   const [mcpToolName, setMcpToolName] = useState('fal_generate_media');
   const [mcpResultJson, setMcpResultJson] = useState<string>('');
 
+  // Godmode-TitanCore Local MCP Hub state
+  const [mcpEndpoints, setMcpEndpoints] = useState<McpEndpointRecord[]>([]);
+  const [mcpAuditLogs, setMcpAuditLogs] = useState<McpAuditEntry[]>([]);
+  const [selfHealingEvents, setSelfHealingEvents] = useState<SelfHealingEvent[]>([]);
+  const [mcpEpName, setMcpEpName] = useState('nexus-universal-webhook');
+  const [mcpEpTransport, setMcpEpTransport] = useState<McpTransportType>('httpx_webhook');
+  const [mcpEpTarget, setMcpEpTarget] = useState('http://localhost:3000/v1/mcp/rpc');
+  const [mcpEpAuthMode, setMcpEpAuthMode] = useState<'hmac_sha256' | 'bearer' | 'none'>('hmac_sha256');
+  const [isGeneratingMcpEp, setIsGeneratingMcpEp] = useState(false);
+  const [selectedMcpEndpoint, setSelectedMcpEndpoint] = useState<McpEndpointRecord | null>(null);
+  const [mcpProbeOutput, setMcpProbeOutput] = useState<string>('');
+
   const loadOverview = async (q = modelQuery, mod = modalityFilter) => {
     setErrorMsg(null);
     try {
       const qs = new URLSearchParams();
       if (q.trim()) qs.set('query', q.trim());
       if (mod !== 'all') qs.set('modality', mod);
-      const res = await fetch(`/v1/infra/overview?${qs.toString()}`);
+      const [res, mcpAuditRes] = await Promise.all([
+        fetch(`/v1/infra/overview?${qs.toString()}`),
+        fetch('/v1/mcp/audit'),
+      ]);
       if (!res.ok) throw new Error('Nepodařilo se načíst přehled infrastruktury.');
       const data = await res.json();
       setSummary(data.summary);
@@ -158,6 +177,16 @@ export const InfraCloudView: React.FC = () => {
       setWorkflowRuns(data.workflowRuns || []);
       setTrainingJobs(data.trainingJobs || []);
       setMcpTools(data.mcpTools || []);
+
+      if (mcpAuditRes.ok) {
+        const auditData = await mcpAuditRes.json();
+        setMcpEndpoints(auditData.endpoints || []);
+        setMcpAuditLogs(auditData.auditLogs || []);
+        setSelfHealingEvents(auditData.selfHealingEvents || []);
+        if (!selectedMcpEndpoint && auditData.endpoints?.length > 0) {
+          setSelectedMcpEndpoint(auditData.endpoints[0]);
+        }
+      }
     } catch (err: any) {
       setErrorMsg(err?.message || 'Chyba při komunikaci se serverem.');
     } finally {
@@ -1691,6 +1720,280 @@ export const InfraCloudView: React.FC = () => {
   }
 }`}
               </pre>
+            </div>
+          </section>
+
+          {/* Godmode-TitanCore Local MCP Hub: Universal Adaptable httpx Webhook & stdio Generator */}
+          <section
+            data-testid="godmode-mcp-hub-panel"
+            className="lg:col-span-12 rounded-lg border border-emerald-500/30 bg-zinc-900/50 p-5 space-y-5"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-800 pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="rounded bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 font-mono text-[10px] font-bold text-emerald-300 uppercase">
+                    GODMODE-TITANCORE MCP HUB
+                  </span>
+                  <span className="font-mono text-[10px] text-zinc-400">
+                    JSON-RPC 2.0 · Streamable SSE · stdio Sandbox · Level-1 Self-Healing
+                  </span>
+                </div>
+                <h2 className="text-base font-semibold text-white mt-1">
+                  Generátor univerzálně adaptabilních httpx Webhook &amp; stdio MCP Endpointů
+                </h2>
+              </div>
+              <div className="text-xs font-mono text-zinc-400 tabular-nums">
+                {mcpEndpoints.length} endpointů · {selfHealingEvents.length} self-healing oprav · {mcpAuditLogs.length} audit záznamů
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              {/* Endpoint Generator Form */}
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setIsGeneratingMcpEp(true);
+                  setErrorMsg(null);
+                  setStatusNotice(null);
+                  try {
+                    const res = await fetch('/v1/mcp/endpoints/generate', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        name: mcpEpName.trim(),
+                        transport: mcpEpTransport,
+                        targetUrlOrCommand: mcpEpTarget.trim(),
+                        authMode: mcpEpAuthMode,
+                      }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.error || 'Generování MCP endpointu selhalo.');
+                    setMcpEndpoints((prev) => [data.endpoint, ...prev]);
+                    setSelectedMcpEndpoint(data.endpoint);
+                    setStatusNotice(`MCP endpoint "${data.endpoint.name}" bezpečně vygenerován a zaregistrován.`);
+                  } catch (err: any) {
+                    setErrorMsg(err?.message || 'Chyba při generování MCP endpointu.');
+                  } finally {
+                    setIsGeneratingMcpEp(false);
+                  }
+                }}
+                className="lg:col-span-5 space-y-3 rounded-lg border border-zinc-800 bg-zinc-950/70 p-4"
+              >
+                <div className="text-xs font-mono font-bold text-emerald-300 uppercase">
+                  1. Vytvořit adaptabilní endpoint
+                </div>
+
+                <div>
+                  <label htmlFor="mcp-ep-name" className="block text-xs text-zinc-300 mb-1">
+                    Název endpointu
+                  </label>
+                  <input
+                    id="mcp-ep-name"
+                    data-testid="mcp-ep-name-input"
+                    type="text"
+                    required
+                    value={mcpEpName}
+                    onChange={(e) => setMcpEpName(e.target.value)}
+                    className="w-full rounded border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label htmlFor="mcp-ep-transport" className="block text-xs text-zinc-300 mb-1">
+                      Transport
+                    </label>
+                    <select
+                      id="mcp-ep-transport"
+                      data-testid="mcp-ep-transport-select"
+                      value={mcpEpTransport}
+                      onChange={(e) => {
+                        const t = e.target.value as McpTransportType;
+                        setMcpEpTransport(t);
+                        if (t === 'stdio') setMcpEpTarget('npx -y @nexus/local-mcp');
+                        else setMcpEpTarget('http://localhost:3000/v1/mcp/rpc');
+                      }}
+                      className="w-full rounded border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono text-white"
+                    >
+                      <option value="httpx_webhook">httpx Webhook</option>
+                      <option value="stdio">stdio (Local MCP)</option>
+                      <option value="streamable_http">Streamable HTTP / SSE</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="mcp-ep-auth" className="block text-xs text-zinc-300 mb-1">
+                      Autentizace
+                    </label>
+                    <select
+                      id="mcp-ep-auth"
+                      value={mcpEpAuthMode}
+                      onChange={(e) => setMcpEpAuthMode(e.target.value as 'hmac_sha256' | 'bearer' | 'none')}
+                      className="w-full rounded border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono text-white"
+                    >
+                      <option value="hmac_sha256">HMAC-SHA256</option>
+                      <option value="bearer">Bearer Token</option>
+                      <option value="none">Lokální (None)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label htmlFor="mcp-ep-target" className="block text-xs text-zinc-300 mb-1">
+                    {mcpEpTransport === 'stdio' ? 'Whitelisted příkaz (bez shell=True)' : 'Cílová HTTP/HTTPS URL'}
+                  </label>
+                  <input
+                    id="mcp-ep-target"
+                    data-testid="mcp-ep-target-input"
+                    type="text"
+                    required
+                    value={mcpEpTarget}
+                    onChange={(e) => setMcpEpTarget(e.target.value)}
+                    className="w-full rounded border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  data-testid="mcp-generate-endpoint-btn"
+                  disabled={isGeneratingMcpEp}
+                  className="w-full rounded bg-emerald-500 px-3.5 py-2 text-xs font-bold font-mono text-black hover:bg-emerald-400 disabled:opacity-50 transition"
+                >
+                  {isGeneratingMcpEp ? 'Generuji endpoint...' : 'Vygenerovat httpx / stdio MCP Endpoint'}
+                </button>
+              </form>
+
+              {/* Generated Snippets & Probe Viewer */}
+              <div className="lg:col-span-7 space-y-3">
+                {selectedMcpEndpoint ? (
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="font-mono text-xs font-bold text-white">
+                          {selectedMcpEndpoint.name}
+                        </span>
+                        <span className="ml-2 rounded bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.5 font-mono text-[10px] text-cyan-300">
+                          {selectedMcpEndpoint.transport}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          data-testid="mcp-probe-endpoint-btn"
+                          onClick={async () => {
+                            const res = await fetch(`/v1/mcp/endpoints/${selectedMcpEndpoint.id}/test`, {
+                              method: 'POST',
+                            });
+                            const data = await res.json();
+                            if (res.ok) {
+                              setMcpEndpoints((prev) =>
+                                prev.map((ep) => (ep.id === selectedMcpEndpoint.id ? data.endpoint : ep))
+                              );
+                              setSelectedMcpEndpoint(data.endpoint);
+                              setMcpProbeOutput(JSON.stringify(data.probeResult, null, 2));
+                            }
+                          }}
+                          className="rounded border border-cyan-500/40 bg-cyan-500/15 px-2.5 py-1 text-[11px] font-mono font-bold text-cyan-300 hover:bg-cyan-500/25 transition"
+                        >
+                          Otestovat MCP Probe
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy('httpx-snippet', selectedMcpEndpoint.httpxPythonCode)}
+                          className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-mono text-zinc-200 hover:text-white"
+                        >
+                          {copiedId === 'httpx-snippet' ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                          <span>Kopírovat Python httpx</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-[10px] font-mono uppercase text-zinc-400 mb-1">
+                          Python httpx Adaptabilní Klient
+                        </div>
+                        <pre
+                          data-testid="mcp-generated-python-code"
+                          className="max-h-48 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-2.5 text-[10px] font-mono text-emerald-300"
+                        >
+                          {selectedMcpEndpoint.httpxPythonCode}
+                        </pre>
+                      </div>
+                      <div>
+                        <div className="text-[10px] font-mono uppercase text-zinc-400 mb-1">
+                          stdio MCP Konfigurace
+                        </div>
+                        <pre
+                          data-testid="mcp-generated-stdio-config"
+                          className="max-h-48 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-2.5 text-[10px] font-mono text-cyan-300"
+                        >
+                          {selectedMcpEndpoint.stdioConfigJson}
+                        </pre>
+                      </div>
+                    </div>
+
+                    {mcpProbeOutput && (
+                      <pre className="rounded border border-emerald-500/30 bg-emerald-950/20 p-2.5 text-[10px] font-mono text-emerald-200">
+                        {mcpProbeOutput}
+                      </pre>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-zinc-800 p-6 text-center text-xs font-mono text-zinc-500">
+                    Vyberte nebo vygenerujte adaptabilní MCP endpoint vlevo.
+                  </div>
+                )}
+
+                {/* Registered Endpoints & Recent Self-Healing / Audit */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 font-mono text-[11px]">
+                  <div className="rounded border border-zinc-800 bg-zinc-950/60 p-3 space-y-1.5">
+                    <div className="text-[10px] uppercase text-zinc-400 font-bold">
+                      Aktivní Endpointy ({mcpEndpoints.length})
+                    </div>
+                    <div className="max-h-32 overflow-y-auto space-y-1">
+                      {mcpEndpoints.map((ep) => (
+                        <button
+                          key={ep.id}
+                          type="button"
+                          onClick={() => setSelectedMcpEndpoint(ep)}
+                          className={`w-full text-left rounded border px-2 py-1 flex items-center justify-between gap-2 ${
+                            selectedMcpEndpoint?.id === ep.id
+                              ? 'border-emerald-500/40 bg-emerald-950/20 text-white'
+                              : 'border-zinc-800/80 bg-zinc-900/40 text-zinc-300'
+                          }`}
+                        >
+                          <span className="truncate">{ep.name}</span>
+                          <span className="text-[9px] text-emerald-400 shrink-0 tabular-nums">
+                            {ep.transport} · {ep.invocationsCount}×
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded border border-zinc-800 bg-zinc-950/60 p-3 space-y-1.5">
+                    <div className="text-[10px] uppercase text-zinc-400 font-bold">
+                      Self-Healing &amp; Audit Log ({selfHealingEvents.length + mcpAuditLogs.length})
+                    </div>
+                    <div className="max-h-32 overflow-y-auto space-y-1 text-[10px]">
+                      {selfHealingEvents.slice(0, 4).map((ev) => (
+                        <div key={ev.id} className="rounded bg-emerald-950/20 border border-emerald-500/20 px-2 py-1 text-emerald-300">
+                          [HEAL:{ev.source}] {ev.repairAction}
+                        </div>
+                      ))}
+                      {mcpAuditLogs.slice(0, 4).map((log) => (
+                        <div key={log.id} className="rounded bg-zinc-900/60 border border-zinc-800 px-2 py-1 text-zinc-300">
+                          [{log.kind}] {log.toolOrMethod} ({log.latencyMs}ms)
+                        </div>
+                      ))}
+                      {selfHealingEvents.length === 0 && mcpAuditLogs.length === 0 && (
+                        <div className="text-zinc-500">Zatím žádné události v tomto běhu.</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </section>
         </div>

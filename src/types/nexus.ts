@@ -13,6 +13,12 @@ export interface Agent {
   status: 'active' | 'paused';
   systemPrompt?: string;
   avatarIcon?: string;
+  revenueContributionCzk?: number;
+  attributedAssetsCount?: number;
+  attributedOpportunitiesCount?: number;
+  avgRevenuePerAssetCzk?: number;
+  roiEfficiencyScore?: number;
+  attributionSharePercent?: number;
 }
 
 export interface Opportunity {
@@ -23,6 +29,8 @@ export interface Opportunity {
   confidence: number;
   status: 'new' | 'active' | 'won' | 'paused' | 'closed';
   updatedAt: string;
+  ownerAgentId?: string;
+  ownerAgentName?: string;
 }
 
 export interface Activity {
@@ -54,6 +62,43 @@ export interface StepPlanItem {
   assignedAgent?: string;
 }
 
+export type MultiGenArtifactType = 'image' | 'video' | 'movie' | 'sketch' | 'meme';
+export type MultiGenMode = 'chat' | MultiGenArtifactType;
+
+export interface SelfHealingEvent {
+  id: string;
+  source: string;
+  issue: string;
+  repairAction: string;
+  originalValue?: any;
+  repairedValue?: any;
+  status: 'repaired' | 'circuit_fallback' | 'blocked';
+  timestamp: string;
+}
+
+export interface MultiGenArtifact {
+  id: string;
+  type: MultiGenArtifactType;
+  modelId: string;
+  modelName: string;
+  title: string;
+  prompt: string;
+  aspectRatio: '9:16' | '16:9' | '1:1';
+  assetId?: string;
+  streamUrl?: string;
+  downloadUrl?: string;
+  previewSvgDataUri?: string;
+  captionTop?: string;
+  captionBottom?: string;
+  scenesCount?: number;
+  durationSec?: number;
+  healingEvents?: SelfHealingEvent[];
+  createdByAgentId: string;
+  createdByAgentName: string;
+  revenueGeneratedCzk: number;
+  createdAt: string;
+}
+
 export interface Message {
   id: string;
   threadId: string;
@@ -75,7 +120,11 @@ export interface Message {
   sources?: string[];
   runId?: string;
   confidence?: number;
+  modelId?: string;
+  multiGenMode?: MultiGenMode;
   generatedAssets?: FactoryAsset[];
+  multiGenArtifacts?: MultiGenArtifact[];
+  selfHealingEvents?: SelfHealingEvent[];
   videoBrief?: VideoCreativeBrief;
   clarificationRequest?: VideoClarificationRequest;
   reasoningTrace?: ReasoningTrace;
@@ -173,6 +222,7 @@ export interface FactoryAsset {
   streamUrl?: string;
   downloadUrl?: string;
   posterUrl?: string;
+  previewUrl?: string;
   signedStreamUrl?: string;
   moviePyScript?: string;
   videoStoryboard?: VideoStoryboard;
@@ -187,6 +237,12 @@ export interface FactoryAsset {
   agnesManifest?: Record<string, any>;
   titanCoreManifest?: TitanCoreManifest;
   nextCommands?: string[];
+  createdByAgentId?: string;
+  createdByAgentName?: string;
+  revenueGeneratedCzk?: number;
+  multiGenType?: MultiGenArtifactType;
+  previewSvgDataUri?: string;
+  modelId?: string;
   createdAt: string;
   updatedAt?: string;
   dryRun?: boolean;
@@ -1054,10 +1110,23 @@ export interface TitanCoreBlock {
 export interface TitanCoreAgnesManifest {
   generator: 'agnes-video-generator';
   version: string;
+  license?: 'MIT';
+  self_hosted?: boolean;
+  execution_mode?: 'cloud-api-no-local-gpu';
+  embedded_browser_runner?: boolean;
   aspect_ratio: '9:16';
   resolution: '1080x1920';
   fps: number;
   language: 'cs-CZ';
+  ai_narration?: {
+    enabled: boolean;
+    mode: string;
+  };
+  digital_anchors?: {
+    enabled: boolean;
+    role: string;
+    framing: string;
+  };
   word_level_subtitles: {
     enabled: boolean;
     safe_zone_y: number;
@@ -1080,10 +1149,31 @@ export interface TitanCoreAgnesManifest {
   }>;
 }
 
+export interface TitanCoreOpenSourceGenRunnerSpec {
+  type: 'embedded-browser-runner';
+  zero_install: boolean;
+  no_gpu_management: boolean;
+  no_account_required: boolean;
+  no_subscription_required: boolean;
+  supported_tasks: Array<'text-to-video' | 'image-to-video'>;
+  models: string[];
+}
+
 export interface TitanCoreAssetBridge {
   opensourcegen_prompt: string;
   opensourcegen_models: string[];
+  opensourcegen_runner?: TitanCoreOpenSourceGenRunnerSpec;
   agnes_manifest: TitanCoreAgnesManifest;
+}
+
+export interface TitanCoreCritiqueSummary {
+  angles_evaluated: string[];
+  selected_angles: string[];
+  ypp_risk_assessment: {
+    originality_score: number;
+    reused_content_risk: 'low' | 'medium' | 'high';
+    recommendation_wedikcz: string;
+  };
 }
 
 export interface TitanCoreManifest {
@@ -1118,6 +1208,7 @@ export interface TitanCoreManifest {
     pinned_comment: string;
   };
   asset_bridge: TitanCoreAssetBridge;
+  critique_summary?: TitanCoreCritiqueSummary;
   next_commands: string[];
 }
 
@@ -1291,5 +1382,71 @@ export interface McpToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, any>;
+}
+
+export interface AgentRevenueLeaderboardSummary {
+  totalAttributedRevenueCzk: number;
+  topAgentId: string;
+  topAgentName: string;
+  topAgentRevenueCzk: number;
+  activeAgentsRevenueCzk: number;
+  totalAssetsTracked: number;
+  totalOpportunitiesTracked: number;
+}
+
+export interface BatchSchedulerChunk {
+  chunkId: string;
+  chunkIndex: number;
+  pipelineKey: string;
+  label: string;
+  modelId: string;
+  modelName: string;
+  format: '9:16' | '16:9';
+  visualStyle: VideoVisualStyle;
+  templateId?: string;
+  itemIds: string[];
+  itemCount: number;
+  totalCreditCost: number;
+  estimatedSavingsPercent: number;
+}
+
+export interface BatchSchedulerPlan {
+  autoChunkOptimize: boolean;
+  maxChunkSize: number;
+  totalQueuedTasks: number;
+  totalChunks: number;
+  estimatedOverheadSavedPercent: number;
+  optimizedExecutionOrder: string[];
+  chunks: BatchSchedulerChunk[];
+  generatedAt: string;
+}
+
+export type McpTransportType = 'httpx_webhook' | 'stdio' | 'streamable_http';
+
+export interface McpEndpointRecord {
+  id: string;
+  name: string;
+  transport: McpTransportType;
+  targetUrlOrCommand: string;
+  authMode: 'hmac_sha256' | 'bearer' | 'none';
+  timeoutMs: number;
+  maxRetries: number;
+  status: 'active' | 'degraded';
+  httpxPythonCode: string;
+  typescriptClientCode: string;
+  stdioConfigJson: string;
+  invocationsCount: number;
+  lastTestedAt?: string;
+  createdAt: string;
+}
+
+export interface McpAuditEntry {
+  id: string;
+  timestamp: string;
+  kind: 'rpc_call' | 'self_healing' | 'endpoint_generated' | 'multigen_run' | 'security_block';
+  toolOrMethod: string;
+  status: 'ok' | 'repaired' | 'blocked' | 'error';
+  latencyMs: number;
+  detail: string;
 }
 

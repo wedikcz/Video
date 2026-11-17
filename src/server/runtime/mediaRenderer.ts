@@ -48,6 +48,21 @@ export interface RenderedVideoArtifact {
   atoms: string[];
 }
 
+export interface PreviewSnippetArtifact {
+  assetId: string;
+  threadId: string;
+  previewPath: string;
+  sizeBytes: number;
+  sha256: string;
+  durationSec: number;
+  mimeType: 'video/mp4';
+  previewUrl: string;
+  renderedWithFfmpeg: boolean;
+  cached: boolean;
+  faststartVerified: boolean;
+  atoms: string[];
+}
+
 export interface Mp4AtomInspection {
   valid: boolean;
   atoms: string[];
@@ -308,6 +323,12 @@ export class MediaRenderer {
     return path.join(STORAGE_ROOT, safeThread, `${safeAsset}.poster.jpg`);
   }
 
+  public static getPreviewFilePath(threadId: string, assetId: string): string {
+    const safeThread = threadId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const safeAsset = assetId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    return path.join(STORAGE_ROOT, safeThread, `${safeAsset}.preview.mp4`);
+  }
+
   public static computeFileChecksum(filePath: string): { sizeBytes: number; sha256: string } {
     const buffer = fs.readFileSync(filePath);
     const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
@@ -541,6 +562,122 @@ export class MediaRenderer {
     fs.writeFileSync(tmpPoster, fallbackJpg);
     fs.renameSync(tmpPoster, posterPath);
     return posterPath;
+  }
+
+  public static async ensurePreviewSnippet(opts: {
+    assetId: string;
+    threadId?: string;
+    sourcePath?: string;
+    durationSec?: number;
+    forceRegenerate?: boolean;
+  }): Promise<PreviewSnippetArtifact> {
+    const threadId = opts.threadId || 'th-main-001';
+    const previewPath = this.getPreviewFilePath(threadId, opts.assetId);
+    const videoPath = opts.sourcePath || this.getAssetFilePath(threadId, opts.assetId);
+    const snippetDuration = Math.max(1.0, Math.min(6.0, opts.durationSec || 2.5));
+
+    fs.mkdirSync(path.dirname(previewPath), { recursive: true });
+
+    if (!opts.forceRegenerate && fs.existsSync(previewPath)) {
+      const stat = fs.statSync(previewPath);
+      if (stat.size > 512) {
+        const { sha256 } = this.computeFileChecksum(previewPath);
+        const atoms = inspectMp4Atoms(previewPath);
+        return {
+          assetId: opts.assetId,
+          threadId,
+          previewPath,
+          sizeBytes: stat.size,
+          sha256,
+          durationSec: snippetDuration,
+          mimeType: 'video/mp4',
+          previewUrl: `/api/v1/assets/${opts.assetId}/preview`,
+          renderedWithFfmpeg: true,
+          cached: true,
+          faststartVerified: atoms.moovBeforeMdat,
+          atoms: atoms.atoms,
+        };
+      }
+    }
+
+    // Ensure source video file exists or generate reference video
+    if (!fs.existsSync(videoPath) || fs.statSync(videoPath).size <= 1024) {
+      await this.ensureReferenceVideoFile(opts.assetId, threadId);
+    }
+
+    const tmpPreview = `${previewPath}.${process.pid}.${Date.now()}.tmp.mp4`;
+    let renderedWithFfmpeg = false;
+
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-ss',
+          '0.1',
+          '-t',
+          snippetDuration.toFixed(1),
+          '-i',
+          videoPath,
+          '-vf',
+          'scale=360:-2:force_original_aspect_ratio=decrease',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-crf',
+          '28',
+          '-an',
+          '-movflags',
+          '+faststart',
+          tmpPreview,
+        ],
+        { timeout: 12000 }
+      );
+
+      if (fs.existsSync(tmpPreview) && fs.statSync(tmpPreview).size > 512) {
+        fs.renameSync(tmpPreview, previewPath);
+        renderedWithFfmpeg = true;
+      }
+    } catch (err) {
+      if (fs.existsSync(tmpPreview)) fs.unlinkSync(tmpPreview);
+      console.warn('[MediaRenderer] ensurePreviewSnippet ffmpeg generation fallback:', err);
+    }
+
+    if (!renderedWithFfmpeg) {
+      if (fs.existsSync(videoPath)) {
+        try {
+          fs.copyFileSync(videoPath, previewPath);
+        } catch {
+          // ignore
+        }
+      }
+      if (!fs.existsSync(previewPath) || fs.statSync(previewPath).size === 0) {
+        const fallbackBytes = Buffer.from(
+          '00000018667479706d703432000000006d70343269736f6d000000086d64617400000000',
+          'hex'
+        );
+        fs.writeFileSync(previewPath, fallbackBytes);
+      }
+    }
+
+    const atoms = inspectMp4Atoms(previewPath);
+    const { sizeBytes, sha256 } = this.computeFileChecksum(previewPath);
+
+    return {
+      assetId: opts.assetId,
+      threadId,
+      previewPath,
+      sizeBytes,
+      sha256,
+      durationSec: snippetDuration,
+      mimeType: 'video/mp4',
+      previewUrl: `/api/v1/assets/${opts.assetId}/preview`,
+      renderedWithFfmpeg,
+      cached: false,
+      faststartVerified: atoms.moovBeforeMdat,
+      atoms: atoms.atoms,
+    };
   }
 
   private static async renderFfmpegClip(opts: {

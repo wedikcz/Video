@@ -10,12 +10,21 @@ import { MemoryService } from './memory.ts';
 import { TracerService } from './tracer.ts';
 import { VideoDirectorEngine } from './videoDirector.ts';
 import { db } from '../db.ts';
-import { Message, StepPlanItem, VideoCreativeBrief } from '../../types/nexus.ts';
+import {
+  Message,
+  MultiGenArtifact,
+  MultiGenMode,
+  SelfHealingEvent,
+  StepPlanItem,
+  VideoCreativeBrief,
+} from '../../types/nexus.ts';
 
 export interface RunExecutionParams {
   threadId: string;
   userMessage: string;
   dryRun?: boolean;
+  modelId?: string;
+  multiGenMode?: MultiGenMode;
   onStreamEvent?: (event: { type: 'delta' | 'tool_event' | 'span' | 'done'; data: any }) => void;
 }
 
@@ -121,8 +130,14 @@ export class AgentOrchestrator {
         inputLower.includes('troll') ||
         inputLower.includes('komunit'));
 
+    const explicitMultiGenMode: MultiGenMode =
+      params.multiGenMode && params.multiGenMode !== 'chat'
+        ? params.multiGenMode
+        : 'chat';
+    const isMultiGenGoal = explicitMultiGenMode !== 'chat';
+
     const isSwitchedAwayFromVideo =
-      isExplicitMoneyGoal || isExplicitAffiliateGoal || isExplicitBoardroomGoal || isExplicitCommentGoal;
+      isMultiGenGoal || isExplicitMoneyGoal || isExplicitAffiliateGoal || isExplicitBoardroomGoal || isExplicitCommentGoal;
     if (isSwitchedAwayFromVideo && priorDraft) {
       db.videoBriefDrafts.delete(params.threadId);
     }
@@ -134,12 +149,20 @@ export class AgentOrchestrator {
           priorDraft,
         });
 
-    const isVideoGoal = Boolean(directorAnalysis?.isVideoIntent);
+    const isVideoGoal = !isMultiGenGoal && Boolean(directorAnalysis?.isVideoIntent);
     const needsClarification = Boolean(
-      directorAnalysis?.isVideoIntent && directorAnalysis?.needsClarification && directorAnalysis?.clarification
+      !isMultiGenGoal && directorAnalysis?.isVideoIntent && directorAnalysis?.needsClarification && directorAnalysis?.clarification
     );
 
-    if (params.onStreamEvent && isVideoGoal && !needsClarification && directorAnalysis) {
+    if (params.onStreamEvent && isMultiGenGoal) {
+      params.onStreamEvent({
+        type: 'span',
+        data: {
+          stage: 'thinking',
+          message: `All-in-One MultiGen (${explicitMultiGenMode.toUpperCase()}) · Model ${params.modelId || 'wan-2-2'}...`,
+        },
+      });
+    } else if (params.onStreamEvent && isVideoGoal && !needsClarification && directorAnalysis) {
       params.onStreamEvent({
         type: 'span',
         data: {
@@ -153,11 +176,13 @@ export class AgentOrchestrator {
     }
 
     const isTitanCoreGoal =
-      inputLower.includes('madlipz') ||
-      inputLower.includes('titancore') ||
-      inputLower.includes('dabing') ||
-      inputLower.includes('ypp');
+      !isMultiGenGoal &&
+      (inputLower.includes('madlipz') ||
+        inputLower.includes('titancore') ||
+        inputLower.includes('dabing') ||
+        inputLower.includes('ypp'));
     const isInfraGoal =
+      !isMultiGenGoal &&
       !isTitanCoreGoal &&
       (inputLower.includes('flux 3') ||
         inputLower.includes('gpt image') ||
@@ -172,14 +197,25 @@ export class AgentOrchestrator {
         inputLower.includes('genmedia') ||
         inputLower.includes('fal agent') ||
         inputLower.includes('inference engine'));
-    const isMoneyGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitMoneyGoal;
-    const isAffiliateGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitAffiliateGoal;
-    const isBoardroomGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitBoardroomGoal;
-    const isCommentGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitCommentGoal;
+    const isMoneyGoal = !isMultiGenGoal && !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitMoneyGoal;
+    const isAffiliateGoal = !isMultiGenGoal && !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitAffiliateGoal;
+    const isBoardroomGoal = !isMultiGenGoal && !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitBoardroomGoal;
+    const isCommentGoal = !isMultiGenGoal && !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitCommentGoal;
 
     const toolsToCall: Array<{ name: string; args: any; idempotencyKey?: string }> = [];
 
-    if (isTitanCoreGoal) {
+    if (isMultiGenGoal) {
+      toolsToCall.push({
+        name: 'multigen_create',
+        args: {
+          type: explicitMultiGenMode,
+          modelId: params.modelId || 'wan-2-2',
+          prompt: params.userMessage,
+          aspectRatio: explicitMultiGenMode === 'video' ? '9:16' : explicitMultiGenMode === 'movie' ? '16:9' : '1:1',
+        },
+        idempotencyKey: `multigen-${runId}`,
+      });
+    } else if (isTitanCoreGoal) {
       toolsToCall.push({
         name: 'run_titancore_madlipz',
         args: {
@@ -309,6 +345,8 @@ export class AgentOrchestrator {
     // 4. Act / Tool Execution Phase
     const toolEvents: Message['toolEvents'] = [];
     const generatedAssets: NonNullable<Message['generatedAssets']> = [];
+    const multiGenArtifacts: MultiGenArtifact[] = [];
+    const selfHealingEvents: SelfHealingEvent[] = [];
 
     for (const toolReq of toolsToCall.slice(0, 2)) {
       const toolSpan = tracer.startSpan(`tool:${toolReq.name}`);
@@ -324,13 +362,21 @@ export class AgentOrchestrator {
         idempotencyKey: toolReq.idempotencyKey,
         dryRun: params.dryRun,
         timeoutMs:
-          toolReq.name === 'render_video_mp4' || toolReq.name === 'run_titancore_madlipz'
+          toolReq.name === 'render_video_mp4' ||
+          toolReq.name === 'run_titancore_madlipz' ||
+          toolReq.name === 'multigen_create'
             ? 30000
             : undefined,
       });
 
       if (execResult.success && execResult.result?.asset) {
         generatedAssets.push(execResult.result.asset);
+      }
+      if (execResult.success && execResult.result?.artifact) {
+        multiGenArtifacts.push(execResult.result.artifact);
+      }
+      if (execResult.success && Array.isArray(execResult.result?.healingEvents)) {
+        selfHealingEvents.push(...execResult.result.healingEvents);
       }
 
       tracer.recordToolCall(
@@ -432,7 +478,22 @@ export class AgentOrchestrator {
     let replyText = '';
     let suggestions: string[] = [];
 
-    if (isTitanCoreGoal) {
+    if (isMultiGenGoal) {
+      const mg = multiGenArtifacts[0];
+      if (mg) {
+        replyText = `Vygeneroval jsem ${mg.type.toUpperCase()} artefakt "${mg.title}" pomocí modelu ${mg.modelName} (${mg.aspectRatio}). Výstup je připsán agentovi ${mg.createdByAgentName} (+${mg.revenueGeneratedCzk} Kč atribuovaný výnos) a uložen do Media Vaultu.${selfHealingEvents.length > 0 ? ` Self-Healing opravil ${selfHealingEvents.length} parametr(ů).` : ''}`;
+      } else {
+        replyText = `MultiGen Toolkit dokončil úlohu v režimu ${explicitMultiGenMode.toUpperCase()}.`;
+      }
+      suggestions = [
+        'Vygeneruj variantu přes LTX-2.5',
+        'Vytvoř k tomuto memu i 9:16 TikTok video',
+        'Převeď koncept do technického sketche',
+        'Zobrazit výnosy agentů v Boardroomu',
+        'Otevřít Media Vault',
+        'Otevřít MCP Hub & endpoint generátor',
+      ];
+    } else if (isTitanCoreGoal) {
       const tcToolOut = toolEvents.find((t) => t.tool === 'run_titancore_madlipz')?.output;
       const tcManifest = tcToolOut?.manifest;
       if (tcManifest) {
@@ -642,7 +703,11 @@ export class AgentOrchestrator {
       sources: retrievedMemories.slice(0, 2).map((m) => m.id),
       runId,
       confidence: needsClarification ? 86 : 94,
+      ...(params.modelId ? { modelId: params.modelId } : {}),
+      ...(explicitMultiGenMode !== 'chat' ? { multiGenMode: explicitMultiGenMode } : {}),
       ...(generatedAssets.length > 0 ? { generatedAssets } : {}),
+      ...(multiGenArtifacts.length > 0 ? { multiGenArtifacts } : {}),
+      ...(selfHealingEvents.length > 0 ? { selfHealingEvents } : {}),
       ...(isVideoGoal && !needsClarification && directorAnalysis ? { videoBrief: directorAnalysis.brief } : {}),
       ...(needsClarification && directorAnalysis?.clarification
         ? { clarificationRequest: directorAnalysis.clarification }

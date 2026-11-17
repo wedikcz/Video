@@ -12,12 +12,14 @@ import {
   Coins,
   Download,
   Eye,
+  Layers,
   ListChecks,
   Pause,
   Play,
   Plus,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   Trash2,
   XCircle,
 } from 'lucide-react';
@@ -34,6 +36,7 @@ import {
 } from '../utils/structuredVideoPrompt.ts';
 import {
   CreateBatchQueueItemInput,
+  buildOptimizedBatchSchedule,
   computeBatchQueueSummary,
 } from '../utils/batchVideoQueue.ts';
 import { downloadVideoAsset } from '../utils/mediaDownload.ts';
@@ -46,6 +49,11 @@ interface BatchQueuePanelProps {
   models: OpenGenModelSpec[];
   defaultModelId: string;
   defaultTemplateId?: string;
+  autoChunkOptimize?: boolean;
+  maxChunkSize?: number;
+  onToggleAutoChunkOptimize?: (next: boolean) => void;
+  onChangeMaxChunkSize?: (size: number) => void;
+  onSeedDemoBatch?: () => void;
   onAddCurrentToQueue: () => void;
   onAddCustomTask: (input: CreateBatchQueueItemInput) => void;
   onRemoveItem: (id: string) => void;
@@ -76,6 +84,11 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
   models,
   defaultModelId,
   defaultTemplateId,
+  autoChunkOptimize = true,
+  maxChunkSize = 3,
+  onToggleAutoChunkOptimize,
+  onChangeMaxChunkSize,
+  onSeedDemoBatch,
   onAddCurrentToQueue,
   onAddCustomTask,
   onRemoveItem,
@@ -97,6 +110,10 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
   const [customDuration, setCustomDuration] = useState<number>(6);
 
   const summary = computeBatchQueueSummary(queue);
+  const schedulePlan = buildOptimizedBatchSchedule(queue, {
+    autoChunkOptimize,
+    maxChunkSize,
+  });
   const selectableModels =
     models.length > 0
       ? models.map((m) => ({ id: m.id, name: m.name, creditCost: m.creditCost }))
@@ -178,7 +195,7 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
           <div className="flex flex-wrap items-center gap-2">
             <ListChecks className="h-4 w-4 text-cyan-400 shrink-0" />
             <h2 className="font-bold text-white uppercase tracking-wide text-[11px]">
-              Sekvenční Batch Processing Fronta ({summary.total})
+              Automatický Batch Scheduler · Chunks ({summary.total})
             </h2>
             {summary.total > 0 && (
               <span
@@ -187,6 +204,17 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
               >
                 Čeká {summary.queued} · Běží {summary.running} · Hotovo {summary.completed}
                 {summary.failed > 0 ? ` · Chyby ${summary.failed}` : ''}
+              </span>
+            )}
+            {schedulePlan.totalChunks > 0 && (
+              <span
+                data-testid="batch-scheduler-savings-badge"
+                className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-300 tabular-nums"
+              >
+                <Layers className="h-3 w-3" />
+                <span>
+                  {schedulePlan.totalChunks} chunků · −{schedulePlan.estimatedOverheadSavedPercent}% režie
+                </span>
               </span>
             )}
             {summary.remainingCreditCost > 0 && (
@@ -199,11 +227,53 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
             )}
           </div>
           <p className="text-[10px] text-zinc-400">
-            Zařaďte více videí s různými prompty, styly, pohyby kamery a formáty; systém je vykreslí přesně popořadě jeden po druhém.
+            Automatický plánovač sdružuje podobné úlohy (stejný model, formát, styl a šablona) do optimalizovaných chunků a minimalizuje režii FFmpeg/pipeline přepínání.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {onToggleAutoChunkOptimize && (
+            <label className="flex items-center gap-1.5 rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px] text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                data-testid="batch-auto-chunk-toggle"
+                checked={autoChunkOptimize}
+                onChange={(e) => onToggleAutoChunkOptimize(e.target.checked)}
+                className="rounded border-zinc-700 bg-zinc-900 text-emerald-500 focus:ring-0"
+              />
+              <span>Auto Chunk Optimalizace</span>
+            </label>
+          )}
+
+          {onChangeMaxChunkSize && (
+            <label className="flex items-center gap-1.5 rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px] text-zinc-300">
+              <span>Chunk:</span>
+              <select
+                data-testid="batch-max-chunk-select"
+                value={maxChunkSize}
+                onChange={(e) => onChangeMaxChunkSize(Number(e.target.value))}
+                className="bg-transparent text-emerald-300 font-bold focus:outline-none tabular-nums"
+              >
+                <option value={2} className="bg-zinc-950">2 úlohy</option>
+                <option value={3} className="bg-zinc-950">3 úlohy</option>
+                <option value={4} className="bg-zinc-950">4 úlohy</option>
+                <option value={6} className="bg-zinc-950">6 úloh</option>
+              </select>
+            </label>
+          )}
+
+          {onSeedDemoBatch && (
+            <button
+              type="button"
+              data-testid="batch-seed-demo-btn"
+              onClick={onSeedDemoBatch}
+              className="flex items-center gap-1.5 rounded border border-purple-500/40 bg-purple-500/10 hover:bg-purple-500/20 px-2.5 py-1.5 text-[11px] font-bold text-purple-200 whitespace-nowrap transition"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-purple-400" />
+              <span>Ukázková dávka (4)</span>
+            </button>
+          )}
+
           <button
             type="button"
             data-testid="batch-add-current-btn"
@@ -259,6 +329,48 @@ export const BatchQueuePanel: React.FC<BatchQueuePanelProps> = ({
           )}
         </div>
       </div>
+
+      {/* Automated Chunk Execution Plan Preview */}
+      {schedulePlan.chunks.length > 0 && (
+        <div
+          data-testid="batch-chunk-plan"
+          className="rounded-lg border border-emerald-500/25 bg-zinc-950/75 p-3 space-y-2"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <span className="font-bold text-emerald-300 flex items-center gap-1.5">
+              <Layers className="h-3.5 w-3.5" />
+              <span>
+                Plán exekuce chunků ({autoChunkOptimize ? 'Optimalizováno dle shody pipeline' : 'FIFO sekvence'})
+              </span>
+            </span>
+            <span className="text-[10px] text-zinc-400 tabular-nums">
+              Úspora režie: <strong className="text-emerald-300">{schedulePlan.estimatedOverheadSavedPercent}%</strong> · Max {schedulePlan.maxChunkSize} úloh/chunk
+            </span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {schedulePlan.chunks.map((chunk) => (
+              <div
+                key={chunk.chunkId}
+                data-testid={`batch-chunk-card-${chunk.chunkIndex}`}
+                className="rounded border border-zinc-800 bg-zinc-900/60 px-2.5 py-2 space-y-1"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-white text-[10px] truncate">
+                    CHUNK #{chunk.chunkIndex} · {chunk.itemCount} úloh
+                  </span>
+                  <span className="rounded bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 text-[9px] font-bold text-emerald-300 tabular-nums shrink-0">
+                    −{chunk.estimatedSavingsPercent}% režie
+                  </span>
+                </div>
+                <div className="text-[10px] text-cyan-300 truncate">{chunk.label}</div>
+                <div className="text-[9px] text-zinc-500 tabular-nums">
+                  Formát {chunk.format} · {chunk.totalCreditCost} kr
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Inline Custom Task Composer */}
       {isComposerOpen && (

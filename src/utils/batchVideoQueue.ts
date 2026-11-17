@@ -4,6 +4,8 @@
  */
 
 import {
+  BatchSchedulerChunk,
+  BatchSchedulerPlan,
   BatchVideoQueueItem,
   OpenGenCameraMotion,
   StructuredVideoPrompt,
@@ -214,6 +216,123 @@ export function getNextPendingBatchItem(
   queue: BatchVideoQueueItem[]
 ): BatchVideoQueueItem | undefined {
   return queue.find((item) => item.status === 'queued');
+}
+
+export function buildOptimizedBatchSchedule(
+  queue: BatchVideoQueueItem[],
+  options: { autoChunkOptimize?: boolean; maxChunkSize?: number } = {}
+): BatchSchedulerPlan {
+  const autoChunkOptimize = options.autoChunkOptimize ?? true;
+  const maxChunkSize = Math.max(1, Math.min(8, Math.round(options.maxChunkSize ?? 3)));
+  const queuedItems = queue.filter((item) => item.status === 'queued');
+
+  if (queuedItems.length === 0) {
+    return {
+      autoChunkOptimize,
+      maxChunkSize,
+      totalQueuedTasks: 0,
+      totalChunks: 0,
+      estimatedOverheadSavedPercent: 0,
+      optimizedExecutionOrder: [],
+      chunks: [],
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  const chunks: BatchSchedulerChunk[] = [];
+
+  if (!autoChunkOptimize) {
+    // FIFO chunking by maxChunkSize without similarity regrouping
+    for (let i = 0; i < queuedItems.length; i += maxChunkSize) {
+      const slice = queuedItems.slice(i, i + maxChunkSize);
+      const lead = slice[0];
+      const pipelineKey = `${lead.modelId}::${lead.format}::${lead.visualStyle}::${lead.templateId || 'default'}`;
+      chunks.push({
+        chunkId: `chunk-fifo-${chunks.length + 1}`,
+        chunkIndex: chunks.length + 1,
+        pipelineKey,
+        label: `FIFO Dávka #${chunks.length + 1} (${lead.format})`,
+        modelId: lead.modelId,
+        modelName: lead.modelName,
+        format: lead.format,
+        visualStyle: lead.visualStyle,
+        templateId: lead.templateId,
+        itemIds: slice.map((s) => s.id),
+        itemCount: slice.length,
+        totalCreditCost: slice.reduce((acc, s) => acc + s.creditCost, 0),
+        estimatedSavingsPercent: 0,
+      });
+    }
+  } else {
+    // Group similar tasks by shared model, aspect ratio, visual style, and template to minimize pipeline warmups
+    const groups = new Map<string, BatchVideoQueueItem[]>();
+    for (const item of queuedItems) {
+      const key = `${item.modelId}::${item.format}::${item.visualStyle}::${item.templateId || 'default'}`;
+      const existing = groups.get(key) || [];
+      existing.push(item);
+      groups.set(key, existing);
+    }
+
+    // Order larger homogeneous groups first for maximum pipeline cache hit ratio
+    const orderedGroups = Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
+
+    for (const [pipelineKey, groupItems] of orderedGroups) {
+      for (let i = 0; i < groupItems.length; i += maxChunkSize) {
+        const slice = groupItems.slice(i, i + maxChunkSize);
+        const lead = slice[0];
+        const paletteLabel = VISUAL_STYLE_PALETTES[lead.visualStyle]?.label || lead.selectedStyleLabel;
+        // Each reused task after the first avoids FFmpeg filter-graph rebuild & model weight cold swap (~28% per extra task)
+        const savings = slice.length > 1 ? Math.min(48, Math.round(((slice.length - 1) / slice.length) * 45)) : 0;
+        chunks.push({
+          chunkId: `chunk-opt-${chunks.length + 1}`,
+          chunkIndex: chunks.length + 1,
+          pipelineKey,
+          label: `${lead.modelName} · ${lead.format} · ${paletteLabel}`,
+          modelId: lead.modelId,
+          modelName: lead.modelName,
+          format: lead.format,
+          visualStyle: lead.visualStyle,
+          templateId: lead.templateId,
+          itemIds: slice.map((s) => s.id),
+          itemCount: slice.length,
+          totalCreditCost: slice.reduce((acc, s) => acc + s.creditCost, 0),
+          estimatedSavingsPercent: savings,
+        });
+      }
+    }
+  }
+
+  const optimizedExecutionOrder = chunks.flatMap((c) => c.itemIds);
+  const weightedSavings =
+    chunks.length === 0
+      ? 0
+      : Math.round(
+          chunks.reduce((acc, c) => acc + c.estimatedSavingsPercent * c.itemCount, 0) /
+            queuedItems.length
+        );
+
+  return {
+    autoChunkOptimize,
+    maxChunkSize,
+    totalQueuedTasks: queuedItems.length,
+    totalChunks: chunks.length,
+    estimatedOverheadSavedPercent: weightedSavings,
+    optimizedExecutionOrder,
+    chunks,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+export function getNextScheduledBatchItem(
+  queue: BatchVideoQueueItem[],
+  options: { autoChunkOptimize?: boolean; maxChunkSize?: number } = {}
+): BatchVideoQueueItem | undefined {
+  const plan = buildOptimizedBatchSchedule(queue, options);
+  if (plan.optimizedExecutionOrder.length === 0) {
+    return getNextPendingBatchItem(queue);
+  }
+  const nextId = plan.optimizedExecutionOrder[0];
+  return queue.find((item) => item.id === nextId && item.status === 'queued') || getNextPendingBatchItem(queue);
 }
 
 export function computeBatchQueueSummary(

@@ -81,6 +81,7 @@ import {
   clearFinishedBatchItems,
   createBatchQueueItem,
   getNextPendingBatchItem,
+  getNextScheduledBatchItem,
   moveBatchQueueItem,
   removeBatchQueueItem,
   retryBatchQueueItem,
@@ -211,9 +212,11 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
   const [gallerySize, setGallerySize] = useState<'mini' | 'small' | 'medium' | 'large'>('medium');
   const [reviewModalAsset, setReviewModalAsset] = useState<FactoryAsset | null>(null);
 
-  // Sequential Batch Processing Queue State
+  // Sequential Batch Processing Queue & Chunk Scheduler State
   const [batchQueue, setBatchQueue] = useState<BatchVideoQueueItem[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [autoChunkOptimize, setAutoChunkOptimize] = useState(true);
+  const [maxChunkSize, setMaxChunkSize] = useState(3);
   const batchQueueRef = useRef<BatchVideoQueueItem[]>([]);
   const isBatchRunningRef = useRef<boolean>(false);
   const batchAbortRef = useRef<AbortController | null>(null);
@@ -860,6 +863,61 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     setTimeout(() => setTemplateSuccessMsg(null), 3000);
   };
 
+  const handleSeedDemoBatch = () => {
+    setErrorMsg(null);
+    const demoTasks: CreateBatchQueueItemInput[] = [
+      {
+        title: 'AI Studio Hook #1 · WAN 2.2',
+        prompt: 'Futuristické studio s neonovými holografickými displeji, rychlý dolly-in nájezd kamery',
+        modelId: 'wan-2-2',
+        modelName: 'Wan 2.2 Turbo (Open)',
+        creditCost: 4,
+        format: '9:16',
+        visualStyle: 'cyberpunk_neon',
+        durationSec: 6,
+      },
+      {
+        title: 'FinTech Case Study · LTX 2.5',
+        prompt: 'Elegantní skleněná kancelář v Praze při západu slunce, 3D grafy výnosnosti ve vzduchu',
+        modelId: 'ltx-2-5',
+        modelName: 'LTX-Video 2.5',
+        creditCost: 4,
+        format: '16:9',
+        visualStyle: 'luxury_gold',
+        durationSec: 6,
+      },
+      {
+        title: 'AI Studio Hook #2 · WAN 2.2',
+        prompt: 'Cyberpunk datové centrum s emerald laserovými paprsky, orbit kamery kolem serveru',
+        modelId: 'wan-2-2',
+        modelName: 'Wan 2.2 Turbo (Open)',
+        creditCost: 4,
+        format: '9:16',
+        visualStyle: 'cyberpunk_neon',
+        durationSec: 6,
+      },
+      {
+        title: 'Lokální Short · Chytrý Režisér',
+        prompt: 'Ranní rutina tvůrce obsahu u kávy, minimalistické UI ukazatele produktivity',
+        modelId: 'nexus-local-director',
+        modelName: 'Lokální Chytrý Režisér (Bez API)',
+        creditCost: 0,
+        format: '9:16',
+        visualStyle: 'editorial_coral',
+        durationSec: 6,
+      },
+    ];
+    updateBatchQueueState((prev) => {
+      let next = prev;
+      for (const task of demoTasks) {
+        next = addBatchQueueItem(next, createBatchQueueItem(task));
+      }
+      return next;
+    });
+    setTemplateSuccessMsg('Přidány 4 ukázkové úlohy pro test automatického chunk plánovače.');
+    setTimeout(() => setTemplateSuccessMsg(null), 3000);
+  };
+
   const handlePauseBatchQueue = () => {
     isBatchRunningRef.current = false;
     setIsBatchRunning(false);
@@ -887,7 +945,10 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
 
     try {
       while (isBatchRunningRef.current) {
-        const nextItem = getNextPendingBatchItem(batchQueueRef.current);
+        const nextItem = getNextScheduledBatchItem(batchQueueRef.current, {
+          autoChunkOptimize,
+          maxChunkSize,
+        });
         if (!nextItem) break;
 
         if (nextItem.creditCost > 0 && creditsAvailableRef.current < nextItem.creditCost) {
@@ -2024,7 +2085,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
         </div>
       )}
 
-      {/* SEQUENTIAL BATCH PROCESSING QUEUE */}
+      {/* AUTOMATED CHUNK BATCH PROCESSING SCHEDULER */}
       {studioMode === 'opengen' && (
         <BatchQueuePanel
           queue={batchQueue}
@@ -2034,6 +2095,11 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           models={openGenModels}
           defaultModelId={selectedModelId}
           defaultTemplateId={selectedTemplateId}
+          autoChunkOptimize={autoChunkOptimize}
+          maxChunkSize={maxChunkSize}
+          onToggleAutoChunkOptimize={setAutoChunkOptimize}
+          onChangeMaxChunkSize={setMaxChunkSize}
+          onSeedDemoBatch={handleSeedDemoBatch}
           onAddCurrentToQueue={handleAddCurrentToBatchQueue}
           onAddCustomTask={handleAddCustomBatchTask}
           onRemoveItem={(id) =>

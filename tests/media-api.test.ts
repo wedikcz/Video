@@ -409,5 +409,91 @@ test('OpenGen AI Multi-Model Suite: models catalog, prompt magic, credit top-up 
   }
 });
 
+test('Transient preview generation & Hover-to-preview API endpoint (/api/v1/assets/:asset_id/preview)', async () => {
+  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
 
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
 
+    // 1. Direct unit test on MediaRenderer.ensurePreviewSnippet
+    const snippetArtifact = await MediaRenderer.ensurePreviewSnippet({
+      assetId: 'asset-preview-unit-1',
+      threadId: 'th-preview-test',
+      durationSec: 2.5,
+    });
+
+    assert.ok(snippetArtifact.previewPath.endsWith('.preview.mp4'));
+    assert.ok(fs.existsSync(snippetArtifact.previewPath));
+    assert.ok(snippetArtifact.sizeBytes > 512, `Expected preview snippet >512B, got ${snippetArtifact.sizeBytes}`);
+    assert.equal(snippetArtifact.previewUrl, '/api/v1/assets/asset-preview-unit-1/preview');
+    assert.equal(snippetArtifact.faststartVerified, true, 'Preview snippet must be faststart streamable');
+
+    // Second call should return cached artifact
+    const cachedArtifact = await MediaRenderer.ensurePreviewSnippet({
+      assetId: 'asset-preview-unit-1',
+      threadId: 'th-preview-test',
+      durationSec: 2.5,
+    });
+    assert.equal(cachedArtifact.cached, true);
+
+    // 2. HTTP POST /api/v1/assets/:asset_id/preview (explicit trigger)
+    const postRes = await fetch(`${baseUrl}/api/v1/assets/asset-preview-unit-1/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ duration: 2.5 }),
+    });
+    assert.ok(postRes.status === 200 || postRes.status === 201);
+    const postJson = await postRes.json();
+    assert.equal(postJson.status, 'ready');
+    assert.equal(postJson.assetId, 'asset-preview-unit-1');
+    assert.ok(postJson.previewUrl.includes('/preview'));
+    assert.ok(postJson.sizeBytes > 512);
+
+    // 3. HTTP GET with format=json
+    const jsonRes = await fetch(`${baseUrl}/api/v1/assets/asset-preview-unit-1/preview?format=json`);
+    assert.equal(jsonRes.status, 200);
+    const getJson = await jsonRes.json();
+    assert.equal(getJson.status, 'ready');
+    assert.equal(getJson.assetId, 'asset-preview-unit-1');
+
+    // 4. HTTP HEAD pre-check on /preview
+    const headRes = await fetch(`${baseUrl}/api/v1/assets/asset-preview-unit-1/preview`, { method: 'HEAD' });
+    assert.equal(headRes.status, 200);
+    assert.equal(headRes.headers.get('content-type'), 'video/mp4');
+    assert.equal(headRes.headers.get('accept-ranges'), 'bytes');
+    assert.equal(headRes.headers.get('x-preview-transient'), '1');
+    assert.ok(Number(headRes.headers.get('content-length')) > 512);
+
+    // 5. HTTP GET binary streaming of preview snippet via /api/v1/assets/.../preview and /v1/preview/...
+    const streamRes = await fetch(`${baseUrl}/api/v1/assets/asset-preview-unit-1/preview`);
+    assert.equal(streamRes.status, 200);
+    assert.equal(streamRes.headers.get('content-type'), 'video/mp4');
+    const streamBuffer = await streamRes.arrayBuffer();
+    assert.ok(streamBuffer.byteLength > 512);
+
+    const v1PreviewRes = await fetch(`${baseUrl}/v1/preview/asset-preview-unit-1`);
+    assert.equal(v1PreviewRes.status, 200);
+    assert.equal(v1PreviewRes.headers.get('content-type'), 'video/mp4');
+    assert.equal(v1PreviewRes.headers.get('x-preview-transient'), '1');
+
+    // 6. HTTP Range partial content (206)
+    const rangeRes = await fetch(`${baseUrl}/api/v1/assets/asset-preview-unit-1/preview`, {
+      headers: { Range: 'bytes=0-500' },
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(rangeRes.headers.get('content-range')?.startsWith('bytes 0-500/'), true);
+    assert.equal(Number(rangeRes.headers.get('content-length')), 501);
+
+    // 7. Verify asset list responses include previewUrl
+    const listRes = await fetch(`${baseUrl}/api/v1/assets?line=video`);
+    assert.equal(listRes.status, 200);
+    const listJson = await listRes.json();
+    assert.ok(listJson.assets.some((a: any) => typeof a.previewUrl === 'string'));
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

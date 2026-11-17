@@ -65,6 +65,38 @@ export const MediaVaultView: React.FC<MediaVaultViewProps> = ({
   const [statusFeedback, setStatusFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [playerState, setPlayerState] = useState<'loading' | 'ready' | 'error'>('loading');
   const persistentVideoRef = useRef<HTMLVideoElement>(null);
+  const [hoveredCardId, setHoveredCardId] = useState<string | null>(null);
+  const [activePreviewId, setActivePreviewId] = useState<string | null>(null);
+  const [previewFailedMap, setPreviewFailedMap] = useState<Record<string, boolean>>({});
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (hoverTimerRef.current) {
+        clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleCardMouseEnter = (assetId: string) => {
+    setHoveredCardId(assetId);
+    if (hoverTimerRef.current) {
+      clearTimeout(hoverTimerRef.current);
+    }
+    // Debounce preview activation (180ms) to avoid spamming network when skimming cards
+    hoverTimerRef.current = setTimeout(() => {
+      setActivePreviewId(assetId);
+    }, 180);
+  };
+
+  const handleCardMouseLeave = () => {
+    if (hoverTimerRef.current) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+    setHoveredCardId(null);
+    setActivePreviewId(null);
+  };
 
   const canCreateVideos = !currentActor || currentActor.permissions.includes('create_edit_videos');
   const canPublish = !currentActor || currentActor.permissions.includes('publish_videos');
@@ -468,6 +500,21 @@ export const MediaVaultView: React.FC<MediaVaultViewProps> = ({
                 <div className="text-zinc-400 truncate">
                   <span className="text-zinc-500">Download API:</span> {activeDownloadUrl}
                 </div>
+                <div className="text-zinc-400 flex items-center justify-between gap-1">
+                  <span className="truncate">
+                    <span className="text-zinc-500">Preview API:</span>{' '}
+                    <span className="text-cyan-400 font-mono">/api/v1/assets/{activeAsset.id}/preview</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActivePreviewId((prev) => (prev === activeAsset.id ? null : activeAsset.id));
+                    }}
+                    className="shrink-0 text-[10px] text-emerald-400 hover:text-emerald-300 font-bold underline"
+                  >
+                    {activePreviewId === activeAsset.id ? 'Vypnout náhled' : 'Vyzkoušet'}
+                  </button>
+                </div>
               </div>
 
               {activeAsset.videoBrief && (
@@ -707,27 +754,73 @@ export const MediaVaultView: React.FC<MediaVaultViewProps> = ({
                 key={asset.id}
                 data-testid="vault-video-card"
                 data-asset-id={asset.id}
-                className={`rounded-xl border bg-zinc-900/60 overflow-hidden transition flex ${
+                onMouseEnter={() => handleCardMouseEnter(asset.id)}
+                onMouseLeave={handleCardMouseLeave}
+                className={`rounded-xl border bg-zinc-900/60 overflow-hidden transition-all duration-200 flex ${
                   viewMode === 'list' ? 'flex-col md:flex-row' : 'flex-col'
                 } ${
                   isSelected || isFocused
                     ? 'border-emerald-400 ring-2 ring-emerald-500/25 shadow-lg shadow-emerald-950/30'
-                    : 'border-zinc-800 hover:border-zinc-700'
+                    : activePreviewId === asset.id
+                      ? 'border-emerald-500/60 ring-1 ring-emerald-500/30 shadow-md shadow-emerald-950/20'
+                      : 'border-zinc-800 hover:border-zinc-700'
                 }`}
               >
-                {/* Lightweight Poster Frame Preview */}
+                {/* Lightweight Poster Frame + Hover Transient Video Snippet Preview */}
                 <div
-                  className={`relative bg-black overflow-hidden shrink-0 border-zinc-800 ${
-                    viewMode === 'list' ? 'md:w-44 h-32 md:h-auto border-b md:border-b-0 md:border-r' : 'w-full h-36 border-b'
+                  className={`relative bg-black overflow-hidden shrink-0 border-zinc-800 group/thumb ${
+                    viewMode === 'list' ? 'md:w-48 h-36 md:h-auto border-b md:border-b-0 md:border-r' : 'w-full h-36 sm:h-40 border-b'
                   }`}
                 >
                   <img
-                    src={`/api/v1/assets/${asset.id}/stream?format=poster`}
+                    src={asset.posterUrl || `/api/v1/assets/${asset.id}/stream?format=poster`}
                     alt={`Náhled videa ${asset.title}`}
                     loading="lazy"
-                    className="w-full h-full object-cover opacity-90"
+                    className={`w-full h-full object-cover transition-opacity duration-300 ${
+                      activePreviewId === asset.id && !previewFailedMap[asset.id] ? 'opacity-30' : 'opacity-90'
+                    }`}
                   />
-                  <span className="absolute bottom-2 right-2 rounded bg-black/80 border border-zinc-700 px-1.5 py-0.5 font-mono text-[10px] text-zinc-200 tabular-nums">
+
+                  {/* Transient Video Snippet Overlay on Hover */}
+                  {activePreviewId === asset.id && !previewFailedMap[asset.id] && (
+                    <div className="absolute inset-0 z-10 bg-black flex items-center justify-center">
+                      <video
+                        data-testid={`vault-hover-preview-video-${asset.id}`}
+                        src={asset.previewUrl || `/v1/preview/${asset.id}`}
+                        autoPlay
+                        muted
+                        loop
+                        playsInline
+                        preload="auto"
+                        aria-label={`Živý náhled videa ${asset.title}`}
+                        className="w-full h-full object-cover"
+                        onError={() => {
+                          setPreviewFailedMap((prev) => ({ ...prev, [asset.id]: true }));
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Live Preview Indicator or Hover Cue */}
+                  {activePreviewId === asset.id && !previewFailedMap[asset.id] ? (
+                    <span
+                      data-testid={`preview-badge-${asset.id}`}
+                      className="absolute top-2 left-2 z-20 flex items-center gap-1.5 rounded-full bg-black/85 border border-emerald-500/70 px-2 py-0.5 font-mono text-[9px] text-emerald-400 font-bold backdrop-blur-md shadow-lg shadow-emerald-950/50"
+                    >
+                      <span className="relative flex h-1.5 w-1.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                      </span>
+                      <span>HOVER PREVIEW</span>
+                    </span>
+                  ) : (
+                    <span className="absolute top-2 left-2 z-10 flex items-center gap-1 rounded bg-black/70 border border-zinc-800/80 px-1.5 py-0.5 font-mono text-[9px] text-zinc-400 opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-200">
+                      <Play className="h-2 w-2 text-zinc-400 fill-zinc-400" />
+                      <span>Hover náhled</span>
+                    </span>
+                  )}
+
+                  <span className="absolute bottom-2 right-2 z-20 rounded bg-black/80 border border-zinc-700 px-1.5 py-0.5 font-mono text-[10px] text-zinc-200 tabular-nums">
                     {aspect} · {formatDuration(asset.durationSec || 6)}
                   </span>
                 </div>
@@ -773,6 +866,23 @@ export const MediaVaultView: React.FC<MediaVaultViewProps> = ({
                     >
                       <Play className="h-3 w-3 fill-current" />
                       <span>{isSelected ? 'Aktivní' : 'Přehrát'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid={`vault-preview-toggle-${asset.id}`}
+                      onClick={() => {
+                        setActivePreviewId((prev) => (prev === asset.id ? null : asset.id));
+                      }}
+                      className={`flex items-center gap-1 rounded px-2 py-1.5 text-[11px] transition ${
+                        activePreviewId === asset.id
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                          : 'border border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700'
+                      }`}
+                      title="Zobrazit nebo skrýt transient video náhled"
+                    >
+                      <Film className="h-3 w-3 text-emerald-400" />
+                      <span>{activePreviewId === asset.id ? 'Náhled aktivní' : 'Náhled'}</span>
                     </button>
 
                     <button

@@ -20,6 +20,10 @@ import {
   executeInfraWorkflow,
   runFalUnifiedInference,
 } from '../../engines/fal_infrastructure.ts';
+import {
+  generateAdaptableMcpEndpoint,
+  runMultiGenToolkit,
+} from '../../engines/mcp_hub.ts';
 import { FactoryAsset, VideoCreativeBrief } from '../../types/nexus.ts';
 
 export interface ToolDefinition {
@@ -888,4 +892,58 @@ toolsRegistry.set('run_fal_agent_workflow', {
     return { success: true, dryRun: Boolean(context?.dryRun), workflowRun };
   },
 });
+
+// 20. multigen_create (All-in-One Image / Video / Movie / Sketch / Meme Toolkit)
+toolsRegistry.set('multigen_create', {
+  name: 'multigen_create',
+  description:
+    'All-in-One Multi-Generation Toolkit (image, video, movie, sketch, meme) s podporou modelů WAN-2.2, LTX-2.5 a automatickým self-healingem parametrů.',
+  parameters: z.object({
+    type: z.enum(['image', 'video', 'movie', 'sketch', 'meme']).default('image'),
+    modelId: z.string().default('wan-2-2'),
+    prompt: z.string().min(1),
+    aspectRatio: z.enum(['9:16', '16:9', '1:1']).optional(),
+    durationSec: z.number().optional(),
+    captionTop: z.string().optional(),
+    captionBottom: z.string().optional(),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async (args, context) => {
+    const res = await runMultiGenToolkit({
+      ...args,
+      dryRun: Boolean(context?.dryRun),
+    });
+    return {
+      success: true,
+      dryRun: Boolean(context?.dryRun),
+      artifact: res.artifact,
+      asset: res.asset,
+      healingEvents: res.healingEvents,
+    };
+  },
+});
+
+// 21. mcp_generate_endpoint (Universal Adaptable httpx Webhook / stdio Endpoint Generator)
+toolsRegistry.set('mcp_generate_endpoint', {
+  name: 'mcp_generate_endpoint',
+  description:
+    'Vygeneruje univerzální adaptabilní httpx webhook nebo stdio MCP endpoint se sandbox validací proti shell injekci.',
+  parameters: z.object({
+    name: z.string().min(2),
+    transport: z.enum(['httpx_webhook', 'stdio', 'streamable_http']).default('httpx_webhook'),
+    targetUrlOrCommand: z.string().min(3),
+    authMode: z.enum(['hmac_sha256', 'bearer', 'none']).default('hmac_sha256'),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async (args) => {
+    const endpoint = generateAdaptableMcpEndpoint(args);
+    return {
+      success: true,
+      endpoint,
+    };
+  },
+});
+
 

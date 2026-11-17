@@ -25,6 +25,7 @@ import {
 } from './components/NotebookLMStudioModal.tsx';
 import {
   Agent,
+  AgentRevenueLeaderboardSummary,
   Opportunity,
   Activity,
   FactoryAsset,
@@ -38,6 +39,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<MainAppTab>('chat');
   const [isSystemPaused, setIsSystemPaused] = useState(false);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [revenueSummary, setRevenueSummary] = useState<AgentRevenueLeaderboardSummary | null>(null);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [assets, setAssets] = useState<FactoryAsset[]>([]);
@@ -85,10 +87,32 @@ export default function App() {
     }
   };
 
+  const refreshAgents = async () => {
+    try {
+      const res = await fetch('/v1/agents/revenue-contribution');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.agents)) setAgents(data.agents);
+        if (data.summary) setRevenueSummary(data.summary);
+        return;
+      }
+      const fallback = await fetch('/v1/agents');
+      if (fallback.ok) setAgents(await fallback.json());
+    } catch (err) {
+      console.error('Failed to refresh agents revenue attribution', err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'agents') {
+      refreshAgents();
+    }
+  }, [activeTab]);
+
   const fetchInitialData = async () => {
     try {
-      const [agentsRes, oppsRes, actsRes, assetsRes, healthRes, accountsRes] = await Promise.all([
-        fetch('/v1/agents'),
+      const [agentsRevRes, oppsRes, actsRes, assetsRes, healthRes, accountsRes] = await Promise.all([
+        fetch('/v1/agents/revenue-contribution'),
         fetch('/v1/opportunities'),
         fetch('/v1/activity'),
         fetch('/v1/factory/assets'),
@@ -96,7 +120,14 @@ export default function App() {
         fetch('/v1/accounts'),
       ]);
 
-      if (agentsRes.ok) setAgents(await agentsRes.json());
+      if (agentsRevRes.ok) {
+        const revData = await agentsRevRes.json();
+        if (Array.isArray(revData.agents)) setAgents(revData.agents);
+        if (revData.summary) setRevenueSummary(revData.summary);
+      } else {
+        const agentsRes = await fetch('/v1/agents');
+        if (agentsRes.ok) setAgents(await agentsRes.json());
+      }
       if (oppsRes.ok) setOpportunities(await oppsRes.json());
       if (actsRes.ok) setActivities(await actsRes.json());
       if (assetsRes.ok) setAssets(await assetsRes.json());
@@ -121,6 +152,7 @@ export default function App() {
       if (res.ok) {
         setAssets(await res.json());
       }
+      await refreshAgents();
     } catch (err) {
       console.error('Failed to refresh assets', err);
     }
@@ -130,6 +162,7 @@ export default function App() {
     try {
       const res = await fetch('/v1/opportunities');
       if (res.ok) setOpportunities(await res.json());
+      await refreshAgents();
     } catch (err) {
       console.error('Failed to refresh opportunities', err);
     }
@@ -296,6 +329,8 @@ export default function App() {
         {activeTab === 'agents' && (
           <BoardroomView
             agents={agents}
+            revenueSummary={revenueSummary}
+            onRefreshRevenue={refreshAgents}
             onToggleAgentStatus={handleToggleAgentStatus}
           />
         )}

@@ -28,9 +28,27 @@ import {
   Wand2,
   ChevronLeft,
   PackageCheck,
+  Image as ImageIcon,
+  PenTool,
+  Smile,
+  Clapperboard,
+  ShieldCheck,
+  X,
+  Eye,
+  Check,
+  Copy,
 } from 'lucide-react';
-import { Message, Agent, Activity as ActivityType, RunTrace, FactoryAsset } from '../types/nexus.ts';
+import {
+  Message,
+  Agent,
+  Activity as ActivityType,
+  RunTrace,
+  FactoryAsset,
+  MultiGenMode,
+  OpenGenModelSpec,
+} from '../types/nexus.ts';
 import { downloadVideoAsset, formatBytes, formatDuration } from '../utils/mediaDownload.ts';
+import { getModelAvatar, DEFAULT_AVATAR_PROMPTS } from '../utils/modelAvatars.ts';
 
 interface ChatOSProps {
   onOpenTrace: (trace: RunTrace) => void;
@@ -42,6 +60,30 @@ interface ChatOSProps {
   pendingPrompt?: string | null;
   onClearPendingPrompt?: () => void;
 }
+
+interface ChatModelCardItem {
+  id: string;
+  name: string;
+  badge?: string;
+  provider?: string;
+  creditCost?: number;
+}
+
+const FALLBACK_CHAT_MODELS: ChatModelCardItem[] = [
+  { id: 'wan-2-2', name: 'Wan 2.2 Turbo (Open)', badge: 'WAN 2.2', provider: 'Alibaba OpenGen', creditCost: 4 },
+  { id: 'ltx-2-5', name: 'LTX-Video 2.5', badge: 'LTX 2.5', provider: 'Lightricks', creditCost: 4 },
+  { id: 'nexus-local-director', name: 'Lokální Chytrý Režisér', badge: 'LOCAL 0 Kč', provider: 'NEXUS Engine', creditCost: 0 },
+  { id: 'flux-2-pro', name: 'FLUX 2 Pro', badge: 'FLUX 2', provider: 'Black Forest', creditCost: 5 },
+];
+
+const MULTIGEN_MODE_OPTIONS: Array<{ id: MultiGenMode; label: string; hint: string }> = [
+  { id: 'chat', label: 'Agent Chat', hint: 'Autonomní orchestrátor' },
+  { id: 'image', label: 'Image', hint: 'Grafika & vizuál' },
+  { id: 'video', label: 'Video', hint: 'Krátký H.264 clip' },
+  { id: 'movie', label: 'Movies', hint: 'Filmová 16:9 scéna' },
+  { id: 'sketch', label: 'Sketches', hint: 'Blueprint koncept' },
+  { id: 'meme', label: 'Memes', hint: 'Virální meme karta' },
+];
 
 export const ChatOS: React.FC<ChatOSProps> = ({
   onOpenTrace,
@@ -64,13 +106,92 @@ export const ChatOS: React.FC<ChatOSProps> = ({
   const [activeCarouselIndex, setActiveCarouselIndex] = useState<Record<string, number>>({});
   const [isBatchDownloading, setIsBatchDownloading] = useState<Record<string, boolean>>({});
   const [downloadingAssetId, setDownloadingAssetId] = useState<string | null>(null);
+  const [chatModels, setChatModels] = useState<ChatModelCardItem[]>(
+    FALLBACK_CHAT_MODELS
+  );
+  const [selectedModelId, setSelectedModelId] = useState<string>('wan-2-2');
+  const [multiGenMode, setMultiGenMode] = useState<MultiGenMode>('chat');
+  const [failedAvatars, setFailedAvatars] = useState<Record<string, boolean>>({});
+  const [customAvatars, setCustomAvatars] = useState<Record<string, string>>({});
+  const [isGeneratingAvatar, setIsGeneratingAvatar] = useState<Record<string, boolean>>({});
+  const [avatarNotification, setAvatarNotification] = useState<string | null>(null);
+  const [avatarModal, setAvatarModal] = useState<{
+    modelId: string;
+    modelName: string;
+    avatarUrl: string;
+    prompt: string;
+    artifactId?: string;
+  } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const isSendingRef = useRef<boolean>(false);
 
-  // Load messages on mount
+  const handleGenerateAvatar = async (modelId: string, customPrompt?: string) => {
+    setIsGeneratingAvatar((prev) => ({ ...prev, [modelId]: true }));
+    setAvatarNotification(null);
+    try {
+      const promptToUse =
+        customPrompt ||
+        DEFAULT_AVATAR_PROMPTS[modelId] ||
+        `Futuristický kybernetický avatar pro model ${modelId}: holografický AI portrét, neonové optické prvky a vysoké detaily`;
+
+      const res = await fetch('/v1/multigen/avatars/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          modelId,
+          prompt: promptToUse,
+          threadId: activeThreadId,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data?.avatarUrl) {
+        setCustomAvatars((prev) => ({ ...prev, [modelId]: data.avatarUrl }));
+        setFailedAvatars((prev) => ({ ...prev, [modelId]: false }));
+        setAvatarNotification(
+          `Nový futuristický avatar pro ${modelId.toUpperCase()} úspěšně vygenerován přes MultiGen Toolkit (+1 450 Kč připsáno Visual Agentovi)!`
+        );
+        setTimeout(() => setAvatarNotification(null), 5000);
+        onAssetsUpdated?.();
+      } else {
+        setAvatarNotification(data?.error || 'Generování futuristického avatara selhalo.');
+        setTimeout(() => setAvatarNotification(null), 4000);
+      }
+    } catch (err: any) {
+      console.error('Error generating avatar', err);
+      setAvatarNotification('Síťová chyba při generování avatara.');
+      setTimeout(() => setAvatarNotification(null), 4000);
+    } finally {
+      setIsGeneratingAvatar((prev) => ({ ...prev, [modelId]: false }));
+    }
+  };
+
+  // Load messages & model catalog on mount
   useEffect(() => {
     fetchMessages(activeThreadId);
   }, [activeThreadId]);
+
+  useEffect(() => {
+    fetch('/api/v1/opengen/models')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const list = Array.isArray(data?.models) ? data.models : Array.isArray(data) ? data : [];
+        if (list.length > 0) {
+          // Put wan-2-2 and ltx-2-5 first so their avatars are immediately visible
+          const prioritizedIds = ['wan-2-2', 'ltx-2-5', 'nexus-local-director', 'veo-3-1'];
+          const sorted = [...list].sort((a: any, b: any) => {
+            const ia = prioritizedIds.indexOf(a.id);
+            const ib = prioritizedIds.indexOf(b.id);
+            if (ia !== -1 && ib !== -1) return ia - ib;
+            if (ia !== -1) return -1;
+            if (ib !== -1) return 1;
+            return 0;
+          });
+          setChatModels(sorted.slice(0, 6));
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const fetchMessages = async (threadId: string) => {
     try {
@@ -111,6 +232,8 @@ export const ChatOS: React.FC<ChatOSProps> = ({
       threadId: activeThreadId,
       role: 'user',
       content: text,
+      modelId: selectedModelId,
+      multiGenMode,
       createdAt: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, tempUserMsg]);
@@ -125,6 +248,8 @@ export const ChatOS: React.FC<ChatOSProps> = ({
         body: JSON.stringify({
           content: text,
           dryRun,
+          modelId: selectedModelId,
+          multiGenMode,
         }),
       });
 
@@ -307,7 +432,7 @@ export const ChatOS: React.FC<ChatOSProps> = ({
   return (
     <div className="flex h-[calc(100vh-3.5rem)] w-full overflow-hidden">
       {/* Main Chat Center Panel */}
-      <div className="flex flex-1 flex-col border-r border-zinc-800 bg-zinc-950/70" data-testid="chat-panel">
+      <div className="flex flex-1 min-w-0 flex-col border-r border-zinc-800 bg-zinc-950/70" data-testid="chat-panel">
         {/* Thread Subheader */}
         <div className="flex h-11 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/40 px-4">
           <div className="flex items-center gap-2">
@@ -890,6 +1015,103 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                     );
                   })()}
 
+                  {/* All-in-One Multi-Generation Artifacts (Image, Sketches, Memes, Video, Movies) */}
+                  {msg.multiGenArtifacts && msg.multiGenArtifacts.length > 0 && (
+                    <div className="mt-4 space-y-3" data-testid="chat-multigen-artifacts">
+                      {msg.multiGenArtifacts.map((artifact) => {
+                        const artifactAvatar = getModelAvatar(artifact.modelId);
+                        return (
+                          <div
+                            key={artifact.id}
+                            data-testid={`multigen-card-${artifact.type}`}
+                            className="rounded-lg border border-cyan-500/35 bg-zinc-950/90 overflow-hidden font-mono text-xs"
+                          >
+                            <div className="flex items-center justify-between gap-2 border-b border-zinc-800/80 bg-zinc-900/60 px-3 py-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                {artifactAvatar.imageUrl && !failedAvatars[artifact.modelId] ? (
+                                  <img
+                                    src={artifactAvatar.imageUrl}
+                                    alt={artifact.modelName}
+                                    referrerPolicy="no-referrer"
+                                    className="h-5 w-5 rounded object-cover border border-cyan-400/50 shrink-0"
+                                  />
+                                ) : (
+                                  <Sparkles className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
+                                )}
+                                <span className="font-bold text-white truncate">{artifact.title}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="rounded bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.5 text-[10px] font-bold text-cyan-300 uppercase">
+                                  {artifact.type}
+                                </span>
+                                <span className="rounded bg-amber-500/15 border border-amber-500/30 px-1.5 py-0.5 text-[10px] text-amber-300 tabular-nums">
+                                  @{artifact.createdByAgentName} · +{artifact.revenueGeneratedCzk} Kč
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="p-3 space-y-2.5">
+                              {artifact.previewSvgDataUri && (
+                                <div className="rounded border border-zinc-800 bg-black overflow-hidden flex items-center justify-center">
+                                  <img
+                                    src={artifact.previewSvgDataUri}
+                                    alt={artifact.title}
+                                    referrerPolicy="no-referrer"
+                                    className="max-h-72 w-auto object-contain"
+                                  />
+                                </div>
+                              )}
+                              {artifact.streamUrl && (
+                                <video
+                                  controls
+                                  playsInline
+                                  preload="metadata"
+                                  src={artifact.streamUrl}
+                                  aria-label={`MultiGen přehrávač ${artifact.title}`}
+                                  className="w-full max-h-64 rounded border border-zinc-800 bg-black object-contain"
+                                />
+                              )}
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-400">
+                                <span>
+                                  Model: <strong className="text-zinc-200">{artifact.modelName}</strong> · Poměr {artifact.aspectRatio}
+                                </span>
+                                {onOpenVaultAsset && artifact.assetId && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onOpenVaultAsset(artifact.assetId!)}
+                                    className="inline-flex items-center gap-1 rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-[10px] text-cyan-300 hover:border-cyan-400/60 hover:text-white transition"
+                                  >
+                                    <ExternalLink className="h-3 w-3" />
+                                    <span>Otevřít v Media Vaultu</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Self-Healing Level-1 Event Log Badges */}
+                  {msg.selfHealingEvents && msg.selfHealingEvents.length > 0 && (
+                    <div
+                      data-testid="chat-self-healing-events"
+                      className="mt-3 rounded border border-emerald-500/30 bg-emerald-950/20 px-3 py-2 font-mono text-[11px] space-y-1"
+                    >
+                      <div className="flex items-center gap-1.5 text-emerald-400 font-bold text-[10px] uppercase">
+                        <ShieldCheck className="h-3.5 w-3.5" />
+                        <span>TitanCore Self-Healing ({msg.selfHealingEvents.length})</span>
+                      </div>
+                      {msg.selfHealingEvents.map((ev) => (
+                        <div key={ev.id} className="text-zinc-300 text-[10px]">
+                          <span className="text-amber-300">[{ev.source}]</span> {ev.issue} →{' '}
+                          <span className="text-emerald-300">{ev.repairAction}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* 3-Step Action Plan */}
                   {msg.plan && msg.plan.length > 0 && (
                     <div className="mt-4 rounded border border-zinc-800/90 bg-zinc-950/70 p-3">
@@ -1040,15 +1262,221 @@ export const ChatOS: React.FC<ChatOSProps> = ({
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input Composer */}
-        <div className="border-t border-zinc-800/80 bg-zinc-900/50 p-4">
+        {/* Model Selection (WAN-2.2 & LTX-2.5 Futuristic Avatars) + MultiGen Toolkit & Input Composer */}
+        <div className="border-t border-zinc-800/80 bg-zinc-900/50 p-3 sm:p-4 space-y-2.5">
+          {/* Avatar Generated Notification Toast */}
+          {avatarNotification && (
+            <div
+              data-testid="chat-avatar-toast"
+              className="flex items-center justify-between rounded-lg border border-cyan-500/40 bg-cyan-950/85 px-3 py-1.5 font-mono text-[11px] text-cyan-200 shadow-sm"
+            >
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="h-3.5 w-3.5 text-cyan-300 shrink-0" />
+                <span>{avatarNotification}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAvatarNotification(null)}
+                className="text-cyan-400 hover:text-white p-0.5"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
+          {/* Model Selection & MultiGen Bar */}
+          <div className="flex flex-col gap-2">
+            <div
+              data-testid="chat-model-selector"
+              className="flex items-center gap-1.5 overflow-x-auto pb-1"
+            >
+              <span className="font-mono text-[10px] uppercase text-zinc-500 shrink-0 mr-1">
+                Model:
+              </span>
+              {chatModels.map((model) => {
+                const avatar = getModelAvatar(model.id, customAvatars[model.id]);
+                const isSelected = selectedModelId === model.id;
+                const imgBroken = Boolean(failedAvatars[model.id]);
+                const isGenerating = Boolean(isGeneratingAvatar[model.id]);
+                return (
+                  <div
+                    key={model.id}
+                    role="button"
+                    tabIndex={0}
+                    data-testid={`chat-model-card-${model.id}`}
+                    onClick={() => setSelectedModelId(model.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedModelId(model.id);
+                      }
+                    }}
+                    className={`group relative flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left font-mono transition shrink-0 cursor-pointer ${
+                      isSelected
+                        ? `bg-gradient-to-r ${avatar.accentClass} text-white shadow-sm`
+                        : 'border-zinc-800 bg-zinc-950/80 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                    }`}
+                  >
+                    <div
+                      className="relative shrink-0 cursor-pointer"
+                      title={
+                        avatar.imageUrl
+                          ? `Kliknutím otevřete detail avatara ${model.name}`
+                          : undefined
+                      }
+                      onClick={(e) => {
+                        if (avatar.imageUrl) {
+                          e.stopPropagation();
+                          setAvatarModal({
+                            modelId: model.id,
+                            modelName: model.name,
+                            avatarUrl: avatar.imageUrl,
+                            prompt:
+                              DEFAULT_AVATAR_PROMPTS[model.id] ||
+                              `Futuristický kybernetický avatar pro model ${model.name}`,
+                          });
+                        }
+                      }}
+                    >
+                      {avatar.imageUrl && !imgBroken ? (
+                        <img
+                          src={avatar.imageUrl}
+                          alt={`${model.name} futuristický avatar`}
+                          referrerPolicy="no-referrer"
+                          onError={() =>
+                            setFailedAvatars((prev) => ({ ...prev, [model.id]: true }))
+                          }
+                          className="h-7 w-7 rounded object-cover border border-white/20 shrink-0 bg-zinc-900 group-hover:border-cyan-400 transition"
+                        />
+                      ) : (
+                        <div className="flex h-7 w-7 items-center justify-center rounded border border-zinc-700 bg-zinc-900 text-[9px] font-bold text-emerald-400 shrink-0">
+                          {avatar.shortTag.slice(0, 3)}
+                        </div>
+                      )}
+
+                      {/* Generating Spinner Overlay */}
+                      {isGenerating && (
+                        <div className="absolute inset-0 flex items-center justify-center rounded bg-black/80">
+                          <RefreshCw className="h-3 w-3 animate-spin text-cyan-300" />
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="leading-tight">
+                      <div className="text-[11px] font-bold whitespace-nowrap flex items-center gap-1">
+                        <span>{model.name}</span>
+                        {customAvatars[model.id] && (
+                          <span className="rounded bg-cyan-500/20 text-cyan-300 text-[8px] px-1 py-0 border border-cyan-500/40">
+                            AI GEN
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[9px] text-zinc-400 whitespace-nowrap">
+                        {model.badge || avatar.shortTag} · {model.provider || 'AI Engine'}
+                      </div>
+                    </div>
+
+                    {/* Quick Trigger Button for WAN-2.2 and LTX-2.5 */}
+                    {(model.id === 'wan-2-2' || model.id === 'ltx-2-5') && (
+                      <button
+                        type="button"
+                        data-testid={`generate-avatar-btn-${model.id}`}
+                        title={`Vygenerovat nový avatar přes Media Toolkit (${model.name})`}
+                        disabled={isGenerating}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleGenerateAvatar(model.id);
+                        }}
+                        className="ml-1 rounded p-1 text-zinc-400 hover:bg-cyan-500/20 hover:text-cyan-300 transition"
+                      >
+                        {isGenerating ? (
+                          <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
+                        ) : (
+                          <Sparkles className="h-3 w-3 text-cyan-400" />
+                        )}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Dedicated Avatar Generator Action for selected model */}
+              {(selectedModelId === 'wan-2-2' || selectedModelId === 'ltx-2-5') && (
+                <button
+                  type="button"
+                  data-testid="interactive-generate-avatar-btn"
+                  disabled={isGeneratingAvatar[selectedModelId]}
+                  onClick={() => handleGenerateAvatar(selectedModelId)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-gradient-to-r from-cyan-500/15 to-violet-500/15 hover:from-cyan-500/25 hover:to-violet-500/25 px-2.5 py-1.5 font-mono text-[11px] font-semibold text-cyan-200 hover:text-white shrink-0 transition"
+                  title="Spustí Media Generation Toolkit API pro vygenerování nového futuristického avatara"
+                >
+                  {isGeneratingAvatar[selectedModelId] ? (
+                    <>
+                      <RefreshCw className="h-3 w-3 animate-spin text-cyan-300" />
+                      <span>Generuji avatar...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3 w-3 text-cyan-300" />
+                      <span>Generovat avatar ({selectedModelId.toUpperCase()})</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+
+            {/* Multi-Generation Toolkit Mode Switcher */}
+            <div
+              data-testid="chat-multigen-toolbar"
+              className="flex flex-wrap items-center gap-1.5 font-mono"
+            >
+              <span className="text-[10px] uppercase text-zinc-500 mr-1">MultiGen Toolkit:</span>
+              {MULTIGEN_MODE_OPTIONS.map((opt) => {
+                const active = multiGenMode === opt.id;
+                const ModeIcon =
+                  opt.id === 'image'
+                    ? ImageIcon
+                    : opt.id === 'video'
+                      ? Film
+                      : opt.id === 'movie'
+                        ? Clapperboard
+                        : opt.id === 'sketch'
+                          ? PenTool
+                          : opt.id === 'meme'
+                            ? Smile
+                            : Bot;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    data-testid={`multigen-mode-${opt.id}`}
+                    onClick={() => setMultiGenMode(opt.id)}
+                    title={opt.hint}
+                    className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] whitespace-nowrap shrink-0 transition ${
+                      active
+                        ? 'border-cyan-400 bg-cyan-500/20 text-white font-bold'
+                        : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                    }`}
+                  >
+                    <ModeIcon className={`h-3 w-3 ${active ? 'text-cyan-300' : 'text-zinc-500'}`} />
+                    <span>{opt.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="relative rounded-lg border border-zinc-800 bg-zinc-950 focus-within:border-emerald-500/50 transition shadow-inner">
             <textarea
               data-testid="chat-input"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Zadejte byznys cíl (např. 'Chci vydělat 50 000 Kč měsíčně', 'Vytvoř mi 5 tik tok videí', 'Spusť AI boardroom')..."
+              placeholder={
+                multiGenMode === 'chat'
+                  ? "Zadejte byznys cíl (např. 'Chci vydělat 50 000 Kč měsíčně', 'Vytvoř mi 5 tik tok videí', 'Spusť AI boardroom')..."
+                  : `MultiGen [${multiGenMode.toUpperCase()} · ${selectedModelId}]: Popište co vygenerovat...`
+              }
               rows={2}
               className="w-full resize-none bg-transparent p-3 pr-24 pb-9 text-xs sm:text-sm text-white placeholder-zinc-500 focus:outline-none"
             />
@@ -1087,7 +1515,7 @@ export const ChatOS: React.FC<ChatOSProps> = ({
       </div>
 
       {/* Right Rail: Swarm, Signals, and Next Steps */}
-      <div className="hidden lg:flex w-80 flex-col border-l border-zinc-800/80 bg-zinc-950 p-4 space-y-5 overflow-y-auto font-mono text-xs">
+      <div className="hidden lg:flex w-80 shrink-0 flex-col border-l border-zinc-800/80 bg-zinc-950 p-4 space-y-5 overflow-y-auto font-mono text-xs">
         {/* Swarm Status */}
         <div>
           <div className="flex items-center justify-between text-zinc-400 text-[11px] uppercase tracking-wider mb-2">
@@ -1150,6 +1578,110 @@ export const ChatOS: React.FC<ChatOSProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Interactive Futuristic Avatar Inspector & Customizer Modal */}
+      {avatarModal && (
+        <div
+          data-testid="futuristic-avatar-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 font-mono"
+        >
+          <div className="relative w-full max-w-lg rounded-xl border border-cyan-500/50 bg-zinc-950 p-5 shadow-2xl shadow-cyan-950/50 space-y-4">
+            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-cyan-400" />
+                <span className="font-bold text-sm text-white">
+                  Futuristický Avatar · {avatarModal.modelName}
+                </span>
+                <span className="rounded bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 text-[10px] border border-cyan-500/40">
+                  {avatarModal.modelId.toUpperCase()}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAvatarModal(null)}
+                className="rounded p-1 text-zinc-400 hover:text-white transition"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center gap-4">
+              <div className="relative h-44 w-44 shrink-0 rounded-xl border border-cyan-500/40 bg-zinc-900 overflow-hidden shadow-inner flex items-center justify-center">
+                <img
+                  src={customAvatars[avatarModal.modelId] || avatarModal.avatarUrl}
+                  alt={`${avatarModal.modelName} avatar preview`}
+                  className="h-full w-full object-contain"
+                />
+                {isGeneratingAvatar[avatarModal.modelId] && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+                    <RefreshCw className="h-6 w-6 animate-spin text-cyan-400" />
+                  </div>
+                )}
+              </div>
+
+              <div className="flex-1 space-y-2 text-xs">
+                <div className="rounded border border-zinc-800 bg-zinc-900/50 p-2.5 text-zinc-300 space-y-1">
+                  <div className="text-[10px] uppercase text-zinc-500 font-bold">Generováno přes:</div>
+                  <div className="text-cyan-300 font-semibold">Local Media Toolkit · 1:1 SVG/AI</div>
+                  <div className="text-[10px] text-zinc-400">
+                    Atributovaný vlastník: <span className="text-zinc-200">Visual Agent</span> · Výnos:{' '}
+                    <span className="text-emerald-400">+1 450 Kč</span>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[10px] uppercase text-zinc-400 font-bold block">
+                    Generační Prompt (Media Toolkit):
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={avatarModal.prompt}
+                    onChange={(e) =>
+                      setAvatarModal((prev) => (prev ? { ...prev, prompt: e.target.value } : null))
+                    }
+                    className="w-full rounded border border-zinc-800 bg-zinc-900 p-2 text-[11px] text-white focus:border-cyan-400 focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 pt-3">
+              <a
+                href={customAvatars[avatarModal.modelId] || avatarModal.avatarUrl}
+                download={`avatar-${avatarModal.modelId}.svg`}
+                className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 hover:text-white transition"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>Stáhnout SVG</span>
+              </a>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="modal-regenerate-avatar-btn"
+                  disabled={isGeneratingAvatar[avatarModal.modelId]}
+                  onClick={async () => {
+                    await handleGenerateAvatar(avatarModal.modelId, avatarModal.prompt);
+                  }}
+                  className="flex items-center gap-1.5 rounded bg-gradient-to-r from-cyan-500 to-violet-500 px-3 py-1.5 text-xs font-bold text-black hover:opacity-90 disabled:opacity-40 transition"
+                >
+                  {isGeneratingAvatar[avatarModal.modelId] ? (
+                    <>
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      <span>Generuji...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Vygenerovat znovu přes Toolkit</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

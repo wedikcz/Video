@@ -31,10 +31,27 @@ export const TitanCoreBlockSchema = z.object({
 export const TitanCoreAgnesManifestSchema = z.object({
   generator: z.literal('agnes-video-generator'),
   version: z.string().min(1),
+  license: z.literal('MIT').optional(),
+  self_hosted: z.boolean().optional(),
+  execution_mode: z.literal('cloud-api-no-local-gpu').optional(),
+  embedded_browser_runner: z.boolean().optional(),
   aspect_ratio: z.literal('9:16'),
   resolution: z.literal('1080x1920'),
   fps: z.number().int().min(24).max(60),
   language: z.literal('cs-CZ'),
+  ai_narration: z
+    .object({
+      enabled: z.boolean(),
+      mode: z.string().min(1),
+    })
+    .optional(),
+  digital_anchors: z
+    .object({
+      enabled: z.boolean(),
+      role: z.string().min(1),
+      framing: z.string().min(1),
+    })
+    .optional(),
   word_level_subtitles: z.object({
     enabled: z.boolean(),
     safe_zone_y: z.number(),
@@ -59,6 +76,26 @@ export const TitanCoreAgnesManifestSchema = z.object({
       })
     )
     .min(4),
+});
+
+export const TitanCoreOpenSourceGenRunnerSchema = z.object({
+  type: z.literal('embedded-browser-runner'),
+  zero_install: z.boolean(),
+  no_gpu_management: z.boolean(),
+  no_account_required: z.boolean(),
+  no_subscription_required: z.boolean(),
+  supported_tasks: z.array(z.enum(['text-to-video', 'image-to-video'])).min(1),
+  models: z.array(z.string().min(1)).min(1),
+});
+
+export const TitanCoreCritiqueSummarySchema = z.object({
+  angles_evaluated: z.array(z.string().min(1)).min(5),
+  selected_angles: z.array(z.string().min(1)).min(1).max(3),
+  ypp_risk_assessment: z.object({
+    originality_score: z.number().min(0).max(100),
+    reused_content_risk: z.enum(['low', 'medium', 'high']),
+    recommendation_wedikcz: z.string().min(10),
+  }),
 });
 
 export const TitanCoreOutputSchema = z.object({
@@ -95,8 +132,10 @@ export const TitanCoreOutputSchema = z.object({
   asset_bridge: z.object({
     opensourcegen_prompt: z.string().min(20),
     opensourcegen_models: z.array(z.string()).min(1),
+    opensourcegen_runner: TitanCoreOpenSourceGenRunnerSchema.optional(),
     agnes_manifest: TitanCoreAgnesManifestSchema,
   }),
+  critique_summary: TitanCoreCritiqueSummarySchema.optional(),
   next_commands: z.array(z.string().min(4)).min(6),
 });
 
@@ -333,6 +372,33 @@ function trimVoiceoverToPacing(text: string, durationSec: number, maxWps = 3.2):
   return /[.!?]$/.test(sliced) ? sliced : `${sliced}.`;
 }
 
+export function buildCritiqueSummary(params: {
+  humorAngle: string;
+  yppScore: number;
+  seriesName: string;
+}) {
+  const anglesEvaluated = [
+    'suchý sarkasmus',
+    'absurdní doslovnost',
+    'přehnaná byrokracie a vážnost',
+    'každodenní český trapas',
+    'vnitřní panika v klidném tónu',
+  ];
+  const score = Math.max(0, Math.min(100, Math.round(params.yppScore)));
+  return {
+    angles_evaluated: anglesEvaluated,
+    selected_angles: [params.humorAngle, 'suchý sarkasmus'],
+    ypp_risk_assessment: {
+      originality_score: score,
+      reused_content_risk: (score >= 92 ? 'low' : score >= 80 ? 'medium' : 'high') as
+        | 'low'
+        | 'medium'
+        | 'high',
+      recommendation_wedikcz: `Spusťte render_ypp_safe.py s LumContrast=0.08, ořezem 1080×1920, odstraněním originální stopy a dominancí lidského CZ dabingu série "${params.seriesName}" v Safe Zone y=1320.`,
+    },
+  };
+}
+
 export function buildAssetBridge(params: {
   visualDescription: string;
   seriesName: string;
@@ -351,10 +417,23 @@ export function buildAssetBridge(params: {
   const agnes_manifest: TitanCoreAgnesManifest = {
     generator: 'agnes-video-generator',
     version: '2.1.0',
+    license: 'MIT',
+    self_hosted: true,
+    execution_mode: 'cloud-api-no-local-gpu',
+    embedded_browser_runner: true,
     aspect_ratio: '9:16',
     resolution: '1080x1920',
     fps,
     language: 'cs-CZ',
+    ai_narration: {
+      enabled: true,
+      mode: 'director_assisted_cz',
+    },
+    digital_anchors: {
+      enabled: true,
+      role: 'madlipz_cz_host',
+      framing: '9:16_split_reaction',
+    },
     word_level_subtitles: {
       enabled: true,
       safe_zone_y: 1320,
@@ -380,6 +459,15 @@ export function buildAssetBridge(params: {
   return {
     opensourcegen_prompt,
     opensourcegen_models: ['LTX-2.3', 'Wan 2.2'],
+    opensourcegen_runner: {
+      type: 'embedded-browser-runner',
+      zero_install: true,
+      no_gpu_management: true,
+      no_account_required: true,
+      no_subscription_required: true,
+      supported_tasks: ['text-to-video', 'image-to-video'],
+      models: ['LTX-2.3', 'Wan 2.2'],
+    },
     agnes_manifest,
   };
 }
@@ -526,6 +614,11 @@ function buildDeterministicMadLipzManifest(
       pinned_comment: `Která hláška ze série ${seriesName} tě dostala nejvíc? Napiš číslo vteřiny do komentáře!`,
     },
     asset_bridge,
+    critique_summary: buildCritiqueSummary({
+      humorAngle,
+      yppScore: 96,
+      seriesName,
+    }),
     next_commands: buildNextCommands({
       series_name: seriesName,
       episode_number: episodeNumber,
@@ -552,16 +645,35 @@ function enrichManifestMetadata(
       ? manifest.next_commands
       : buildNextCommands(manifest);
 
+  const builtBridge = buildAssetBridge({
+    visualDescription: ctx.input.visualDescription,
+    seriesName: manifest.series_name,
+    humorAngle: manifest.humor_angle,
+    blocks: enrichedBlocks,
+    fps: manifest.delivery?.fps || 30,
+  });
+
   const assetBridge =
     manifest.asset_bridge?.opensourcegen_prompt && manifest.asset_bridge?.agnes_manifest
-      ? manifest.asset_bridge
-      : buildAssetBridge({
-          visualDescription: ctx.input.visualDescription,
-          seriesName: manifest.series_name,
-          humorAngle: manifest.humor_angle,
-          blocks: enrichedBlocks,
-          fps: manifest.delivery?.fps || 30,
-        });
+      ? {
+          ...builtBridge,
+          ...manifest.asset_bridge,
+          opensourcegen_runner:
+            manifest.asset_bridge.opensourcegen_runner || builtBridge.opensourcegen_runner,
+          agnes_manifest: {
+            ...builtBridge.agnes_manifest,
+            ...manifest.asset_bridge.agnes_manifest,
+          },
+        }
+      : builtBridge;
+
+  const critiqueSummary =
+    manifest.critique_summary ||
+    buildCritiqueSummary({
+      humorAngle: manifest.humor_angle,
+      yppScore: manifest.ypp_score,
+      seriesName: manifest.series_name,
+    });
 
   return {
     ...manifest,
@@ -570,6 +682,7 @@ function enrichManifestMetadata(
     engine_used: engineName,
     blocks: enrichedBlocks,
     asset_bridge: assetBridge,
+    critique_summary: critiqueSummary,
     next_commands: nextCommands,
   };
 }

@@ -32,6 +32,10 @@ import {
   ComputeGpuInstance,
   InfraWorkflowRun,
   LoraTrainingJob,
+  McpEndpointRecord,
+  McpAuditEntry,
+  SelfHealingEvent,
+  MultiGenArtifact,
 } from '../types/nexus.ts';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -90,6 +94,10 @@ class NexusDatabase {
   public computeGpuInstances: ComputeGpuInstance[] = [];
   public infraWorkflowRuns: InfraWorkflowRun[] = [];
   public loraTrainingJobs: LoraTrainingJob[] = [];
+  public mcpEndpoints: McpEndpointRecord[] = [];
+  public mcpAuditLogs: McpAuditEntry[] = [];
+  public selfHealingEvents: SelfHealingEvent[] = [];
+  public multiGenArtifacts: MultiGenArtifact[] = [];
   private lastCpuSample: { idle: number; total: number } | null = null;
   private lastPerfTickAt: number = Date.now();
   private lastLoopLagMs: number = 1.2;
@@ -146,6 +154,10 @@ class NexusDatabase {
       computeGpuInstances: this.computeGpuInstances.slice(0, 100),
       infraWorkflowRuns: this.infraWorkflowRuns.slice(0, 100),
       loraTrainingJobs: this.loraTrainingJobs.slice(0, 100),
+      mcpEndpoints: this.mcpEndpoints.slice(0, 100),
+      mcpAuditLogs: this.mcpAuditLogs.slice(0, 200),
+      selfHealingEvents: this.selfHealingEvents.slice(0, 120),
+      multiGenArtifacts: this.multiGenArtifacts.slice(0, 120),
     };
   }
 
@@ -195,6 +207,10 @@ class NexusDatabase {
     if (Array.isArray(snapshot.computeGpuInstances)) this.computeGpuInstances = snapshot.computeGpuInstances;
     if (Array.isArray(snapshot.infraWorkflowRuns)) this.infraWorkflowRuns = snapshot.infraWorkflowRuns;
     if (Array.isArray(snapshot.loraTrainingJobs)) this.loraTrainingJobs = snapshot.loraTrainingJobs;
+    if (Array.isArray(snapshot.mcpEndpoints)) this.mcpEndpoints = snapshot.mcpEndpoints;
+    if (Array.isArray(snapshot.mcpAuditLogs)) this.mcpAuditLogs = snapshot.mcpAuditLogs;
+    if (Array.isArray(snapshot.selfHealingEvents)) this.selfHealingEvents = snapshot.selfHealingEvents;
+    if (Array.isArray(snapshot.multiGenArtifacts)) this.multiGenArtifacts = snapshot.multiGenArtifacts;
   }
 
   public loadPersistedState(): boolean {
@@ -267,7 +283,7 @@ class NexusDatabase {
       status: a.tasks > 25 ? 'active' : 'paused',
     }));
 
-    // 6 Opportunities seeded
+    // 6 Opportunities seeded with explicit agent ownership
     this.opportunities = [
       {
         id: 'opp-1',
@@ -276,6 +292,8 @@ class NexusDatabase {
         projectionCzk: 18400,
         confidence: 86,
         status: 'active',
+        ownerAgentId: 'agent-affiliate',
+        ownerAgentName: 'Affiliate Agent',
         updatedAt: new Date(Date.now() - 3600000 * 2).toISOString(),
       },
       {
@@ -285,6 +303,8 @@ class NexusDatabase {
         projectionCzk: 12000,
         confidence: 79,
         status: 'active',
+        ownerAgentId: 'agent-video',
+        ownerAgentName: 'Video Agent',
         updatedAt: new Date(Date.now() - 3600000 * 5).toISOString(),
       },
       {
@@ -294,6 +314,8 @@ class NexusDatabase {
         projectionCzk: 9600,
         confidence: 74,
         status: 'new',
+        ownerAgentId: 'agent-trend',
+        ownerAgentName: 'Trend Agent',
         updatedAt: new Date(Date.now() - 3600000 * 8).toISOString(),
       },
       {
@@ -303,6 +325,8 @@ class NexusDatabase {
         projectionCzk: 15200,
         confidence: 81,
         status: 'new',
+        ownerAgentId: 'agent-cmo',
+        ownerAgentName: 'CMO Agent',
         updatedAt: new Date(Date.now() - 3600000 * 12).toISOString(),
       },
       {
@@ -312,6 +336,8 @@ class NexusDatabase {
         projectionCzk: 7300,
         confidence: 68,
         status: 'new',
+        ownerAgentId: 'agent-seo',
+        ownerAgentName: 'SEO Agent',
         updatedAt: new Date(Date.now() - 3600000 * 18).toISOString(),
       },
       {
@@ -321,6 +347,8 @@ class NexusDatabase {
         projectionCzk: 6100,
         confidence: 72,
         status: 'won',
+        ownerAgentId: 'agent-revenue',
+        ownerAgentName: 'Revenue Agent',
         updatedAt: new Date(Date.now() - 3600000 * 24).toISOString(),
       },
     ];
@@ -396,6 +424,9 @@ class NexusDatabase {
       downloadUrl: '/api/v1/assets/asset-001/download',
       videoStoryboard: initialStoryboard,
       moviePyScript: initialMoviePy,
+      createdByAgentId: 'agent-video',
+      createdByAgentName: 'Video Agent',
+      revenueGeneratedCzk: 5640,
       createdAt: new Date(Date.now() - 3600000 * 6).toISOString(),
       dryRun: false,
     };
@@ -505,6 +536,9 @@ class NexusDatabase {
         meta: 'Formát: Meta Ads / IG Feed, 3 varianty hooku',
         tags: ['Meta Ads', 'Konverze', 'B2B'],
         status: 'ready',
+        createdByAgentId: 'agent-cmo',
+        createdByAgentName: 'CMO Agent',
+        revenueGeneratedCzk: 3400,
         createdAt: new Date(Date.now() - 3600000 * 14).toISOString(),
       },
       {
@@ -516,6 +550,9 @@ class NexusDatabase {
         meta: 'Formát: Next-gen minimalistický funnel, konverzní cíl 24 %',
         tags: ['Landing Page', 'Opt-in', 'Lead Magnet'],
         status: 'ready',
+        createdByAgentId: 'agent-affiliate',
+        createdByAgentName: 'Affiliate Agent',
+        revenueGeneratedCzk: 4850,
         createdAt: new Date(Date.now() - 3600000 * 20).toISOString(),
       },
     ];

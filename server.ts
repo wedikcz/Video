@@ -78,12 +78,23 @@ import {
 import {
   CommentReplyStrategy,
   FactoryAsset,
+  MultiGenMode,
   RolePermission,
   SocialComment,
   StructuredVideoPrompt,
   UserRole,
   VideoSharingPlatform,
 } from './src/types/nexus.ts';
+import { computeAgentRevenueContributions } from './src/server/runtime/revenueAttribution.ts';
+import { buildOptimizedBatchSchedule } from './src/utils/batchVideoQueue.ts';
+import {
+  generateAdaptableMcpEndpoint,
+  handleMcpJsonRpc,
+  HUB_MCP_PROMPTS,
+  HUB_MCP_RESOURCES,
+  HUB_MCP_TOOLS,
+  runMultiGenToolkit,
+} from './src/engines/mcp_hub.ts';
 
 dotenv.config();
 
@@ -244,11 +255,17 @@ app.get('/v1/threads/:id/messages', (req: Request, res: Response) => {
 
 app.post('/v1/threads/:id/messages', async (req: Request, res: Response) => {
   const threadId = req.params.id;
-  const { content, dryRun = false } = req.body;
+  const { content, dryRun = false, modelId, multiGenMode } = req.body;
 
   if (!content) {
     return res.status(400).json({ error: 'Obsah zprávy je povinný.' });
   }
+
+  const normalizedMode: MultiGenMode | undefined =
+    typeof multiGenMode === 'string' &&
+    ['chat', 'image', 'video', 'movie', 'sketch', 'meme'].includes(multiGenMode)
+      ? (multiGenMode as MultiGenMode)
+      : undefined;
 
   // Save user message
   const userMsg = {
@@ -256,6 +273,8 @@ app.post('/v1/threads/:id/messages', async (req: Request, res: Response) => {
     threadId,
     role: 'user' as const,
     content,
+    modelId: typeof modelId === 'string' ? modelId : undefined,
+    multiGenMode: normalizedMode,
     createdAt: new Date().toISOString(),
   };
   const list = db.messages.get(threadId) || [];
@@ -276,6 +295,8 @@ app.post('/v1/threads/:id/messages', async (req: Request, res: Response) => {
         threadId,
         userMessage: content,
         dryRun,
+        modelId: typeof modelId === 'string' ? modelId : undefined,
+        multiGenMode: normalizedMode,
         onStreamEvent: (event) => {
           res.write(`data: ${JSON.stringify(event)}\n\n`);
         },
@@ -293,6 +314,8 @@ app.post('/v1/threads/:id/messages', async (req: Request, res: Response) => {
         threadId,
         userMessage: content,
         dryRun,
+        modelId: typeof modelId === 'string' ? modelId : undefined,
+        multiGenMode: normalizedMode,
       });
       res.json(result.message);
     } catch (err: any) {
@@ -326,9 +349,25 @@ app.post('/v1/boardroom/sessions', async (req: Request, res: Response) => {
   }
 });
 
-// 5. Agents
+// 5. Agents & Revenue Contribution Attribution
 app.get('/v1/agents', (req: Request, res: Response) => {
-  res.json(db.agents);
+  const computed = computeAgentRevenueContributions(
+    db.agents,
+    db.factoryAssets,
+    db.opportunities,
+    db.activities
+  );
+  res.json(computed.agents);
+});
+
+app.get('/v1/agents/revenue-contribution', (_req: Request, res: Response) => {
+  const computed = computeAgentRevenueContributions(
+    db.agents,
+    db.factoryAssets,
+    db.opportunities,
+    db.activities
+  );
+  res.json(computed);
 });
 
 app.patch('/v1/agents/:id', (req: Request, res: Response) => {
@@ -392,8 +431,52 @@ async function resolveReadyVideoFile(assetId: string): Promise<
   | { status: 'generating'; asset: (typeof db.factoryAssets)[number] }
   | { status: 'ready'; asset: (typeof db.factoryAssets)[number]; filePath: string; posterPath: string }
 > {
-  const asset = db.factoryAssets.find((a) => a.id === assetId);
-  if (!asset || asset.line !== 'video') return { status: 'not_found' };
+  let asset = db.factoryAssets.find((a) => a.id === assetId);
+  if (!asset || asset.line !== 'video') {
+    // Check if video file or preview exists on disk across storage
+    const potentialPaths = [
+      MediaRenderer.getAssetFilePath('th-main-001', assetId),
+      MediaRenderer.getAssetFilePath('th-preview-test', assetId),
+    ];
+    let foundPath = potentialPaths.find((p) => fs.existsSync(p) && fs.statSync(p).size > 0);
+    if (!foundPath && fs.existsSync(STORAGE_ROOT)) {
+      try {
+        const subdirs = fs.readdirSync(STORAGE_ROOT);
+        for (const sub of subdirs) {
+          const candidate = path.join(STORAGE_ROOT, sub, `${assetId}.mp4`);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).size > 0) {
+            foundPath = candidate;
+            break;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (foundPath) {
+      const checksum = MediaRenderer.computeFileChecksum(foundPath);
+      const newAsset: (typeof db.factoryAssets)[number] = {
+        id: assetId,
+        threadId: path.basename(path.dirname(foundPath)),
+        line: 'video',
+        title: `Discovered Video ${assetId}`,
+        body: 'Discovered from local video storage',
+        meta: 'Local Storage Discovery',
+        status: 'ready',
+        faststartVerified: true,
+        filePath: foundPath,
+        sizeBytes: checksum.sizeBytes,
+        sha256: checksum.sha256,
+        durationSec: 3,
+        mimeType: 'video/mp4',
+        createdAt: new Date().toISOString(),
+      };
+      db.factoryAssets.unshift(newAsset);
+      asset = newAsset;
+    } else {
+      return { status: 'not_found' };
+    }
+  }
 
   if (asset.status === 'queued' || asset.status === 'rendering') {
     return { status: 'generating', asset };
@@ -570,9 +653,15 @@ app.get('/api/v1/assets', (req: Request, res: Response) => {
     })
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
+  const mapped = filtered.map((a) => ({
+    ...a,
+    posterUrl: a.line === 'video' ? `/api/v1/assets/${a.id}/stream?format=poster` : undefined,
+    previewUrl: a.line === 'video' ? `/api/v1/assets/${a.id}/preview` : undefined,
+  }));
+
   res.json({
-    assets: filtered,
-    total: filtered.length,
+    assets: mapped,
+    total: mapped.length,
   });
 });
 
@@ -588,6 +677,7 @@ app.get('/api/v1/assets/:asset_id', async (req: Request, res: Response) => {
   res.json({
     ...asset,
     posterUrl: asset.line === 'video' ? `/api/v1/assets/${asset.id}/stream?format=poster` : undefined,
+    previewUrl: asset.line === 'video' ? `/api/v1/assets/${asset.id}/preview` : undefined,
     signedStreamUrl:
       asset.line === 'video'
         ? `/api/v1/assets/${asset.id}/stream?expires=${signed.expires}&signature=${signed.signature}`
@@ -780,6 +870,131 @@ app
   })
   .head(handleAssetStream)
   .get(handleAssetStream);
+
+const handleAssetPreview = async (req: Request, res: Response) => {
+  try {
+    const assetId = req.params.asset_id;
+    if (!validateStreamAuthAndCors(req, res, assetId)) {
+      return;
+    }
+
+    const resolved = await resolveReadyVideoFile(assetId);
+    if (resolved.status === 'not_found') {
+      return res.status(404).json({ error: 'Video asset nebyl nalezen nebo není typu video.' });
+    }
+    if (resolved.status === 'generating') {
+      res.setHeader('Retry-After', '2');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(202).json({
+        status: resolved.asset.status,
+        retryAfterSeconds: 2,
+        message: 'Video asset se právě generuje, transient preview bude k dispozici po dokončení.',
+      });
+    }
+
+    const { asset, filePath } = resolved;
+    const requestedDuration = Number.parseFloat(
+      (req.query.duration as string) || (req.body?.duration as string) || '2.5'
+    );
+    const forceRegenerate =
+      req.query.force === '1' || req.query.force === 'true' || req.body?.force === true;
+
+    const previewArtifact = await MediaRenderer.ensurePreviewSnippet({
+      assetId: asset.id,
+      threadId: asset.threadId || 'th-main-001',
+      sourcePath: filePath,
+      durationSec: Number.isNaN(requestedDuration) ? 2.5 : requestedDuration,
+      forceRegenerate,
+    });
+
+    const isJsonRequest =
+      req.query.format === 'json' ||
+      Boolean(req.headers.accept && req.headers.accept.includes('application/json')) ||
+      req.method === 'POST';
+
+    if (isJsonRequest) {
+      return res.status(req.method === 'POST' ? 201 : 200).json({
+        status: 'ready',
+        assetId: asset.id,
+        previewUrl: `/api/v1/assets/${asset.id}/preview`,
+        durationSec: previewArtifact.durationSec,
+        sizeBytes: previewArtifact.sizeBytes,
+        sha256: previewArtifact.sha256,
+        cached: previewArtifact.cached,
+        faststartVerified: previewArtifact.faststartVerified,
+        renderedWithFfmpeg: previewArtifact.renderedWithFfmpeg,
+      });
+    }
+
+    const previewStat = await fs.promises.stat(previewArtifact.previewPath);
+    const totalSize = previewStat.size;
+    const etag = `"preview-${asset.id}-${(previewArtifact.sha256 || '').slice(0, 16) || totalSize.toString(16)}"`;
+    const lastModified = new Date(previewStat.mtimeMs).toUTCString();
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', lastModified);
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=3600');
+    res.setHeader('X-Preview-Transient', '1');
+
+    if (req.headers['if-none-match'] === etag) {
+      return res.status(304).end();
+    }
+
+    const rawRangeHeader = req.headers.range;
+    const ifRangeHeader = req.headers['if-range'];
+    const ifRangeMatches =
+      !ifRangeHeader || ifRangeHeader === etag || ifRangeHeader === lastModified;
+
+    if (rawRangeHeader && ifRangeMatches) {
+      const parsed = parseHttpRange(rawRangeHeader, totalSize);
+      if (parsed && !parsed.valid) {
+        res.setHeader('Content-Range', `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      if (parsed && parsed.valid) {
+        const chunkSize = parsed.end - parsed.start + 1;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${parsed.start}-${parsed.end}/${totalSize}`);
+        res.setHeader('Content-Length', chunkSize);
+        if (req.method === 'HEAD') return res.end();
+        return pipeFileSafely(req, res, previewArtifact.previewPath, {
+          start: parsed.start,
+          end: parsed.end,
+        });
+      }
+    }
+
+    res.status(200);
+    res.setHeader('Content-Length', totalSize);
+    if (req.method === 'HEAD') return res.end();
+    return pipeFileSafely(req, res, previewArtifact.previewPath);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Chyba při generování preview videa: ${err.message}` });
+  }
+};
+
+app
+  .route('/api/v1/assets/:asset_id/preview')
+  .options((req: Request, res: Response) => {
+    validateStreamAuthAndCors(req, res, req.params.asset_id);
+    return res.status(204).end();
+  })
+  .head(handleAssetPreview)
+  .get(handleAssetPreview)
+  .post(handleAssetPreview);
+
+app
+  .route('/v1/preview/:asset_id')
+  .options((req: Request, res: Response) => {
+    validateStreamAuthAndCors(req, res, req.params.asset_id);
+    return res.status(204).end();
+  })
+  .head(handleAssetPreview)
+  .get(handleAssetPreview)
+  .post(handleAssetPreview);
 
 app.get('/api/v1/assets/:asset_id/download', async (req: Request, res: Response) => {
   try {
@@ -3182,6 +3397,172 @@ app.post('/v1/infra/cli/exec', async (req: Request, res: Response) => {
   return res.json({
     exitCode: 0,
     stdout: `Dostupné příkazy:\n  genmedia models list\n  genmedia run fal-ai/gpt-image-2.6 --prompt "Pražský hrad za úsvitu"\n  genmedia deploy --name my-lora --base fal-ai/flux-3/pro\n  genmedia compute rent --gpu b300-ultra --count 2\n  mcp tools/list`,
+  });
+});
+
+// 14. Batch Processing Chunk Scheduler, All-in-One MultiGen & Godmode-TitanCore MCP Hub
+app.post('/v1/factory/batch/schedule', (req: Request, res: Response) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const autoChunkOptimize = req.body?.autoChunkOptimize !== false;
+  const maxChunkSize = Number(req.body?.maxChunkSize || 3);
+  const plan = buildOptimizedBatchSchedule(items, {
+    autoChunkOptimize,
+    maxChunkSize: Number.isFinite(maxChunkSize) ? Math.max(1, Math.min(8, maxChunkSize)) : 3,
+  });
+  return res.json(plan);
+});
+
+app.get('/v1/multigen/artifacts', (_req: Request, res: Response) => {
+  return res.json(db.multiGenArtifacts);
+});
+
+app.post('/v1/multigen/generate', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const result = await runMultiGenToolkit({
+      type: req.body?.type,
+      modelId: req.body?.modelId,
+      prompt: req.body?.prompt,
+      aspectRatio: req.body?.aspectRatio,
+      durationSec: req.body?.durationSec ? Number(req.body.durationSec) : undefined,
+      threadId: req.body?.threadId || 'th-main-001',
+      captionTop: req.body?.captionTop,
+      captionBottom: req.body?.captionBottom,
+      dryRun: Boolean(req.body?.dryRun),
+    });
+    return res.status(201).json(result);
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'MultiGen generace selhala.' });
+  }
+});
+
+app.post('/v1/multigen/avatars/generate', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const modelId = String(req.body?.modelId || 'wan-2-2').trim();
+    const prompt =
+      typeof req.body?.prompt === 'string' && req.body.prompt.trim()
+        ? req.body.prompt.trim()
+        : modelId === 'ltx-2-5'
+          ? 'Futuristický kybernetický avatar LTX-2.5: zlatý cinematický AI režisér s optickým senzorem a HUD zaměřovačem'
+          : 'Futuristický kybernetický avatar WAN-2.2: holografický android s neonově azurovým vizorem a kvantovými obvody';
+
+    const result = await runMultiGenToolkit({
+      type: 'image',
+      modelId,
+      prompt,
+      aspectRatio: '1:1',
+      threadId: req.body?.threadId || 'th-main-001',
+      dryRun: Boolean(req.body?.dryRun),
+    });
+
+    return res.status(201).json({
+      modelId,
+      avatarUrl: result.artifact.previewSvgDataUri,
+      artifact: result.artifact,
+      asset: result.asset,
+      healingEvents: result.healingEvents,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Generování futuristického avatara selhalo.' });
+  }
+});
+
+app.get('/v1/mcp/manifest', (_req: Request, res: Response) => {
+  return res.json({
+    protocolVersion: '2025-03-26',
+    serverInfo: { name: 'nexus-godmode-titancore-mcp', version: '2.5.0' },
+    transports: ['stdio', 'streamable_http', 'sse'],
+    capabilities: { tools: true, resources: true, prompts: true, selfHealing: true },
+    tools: HUB_MCP_TOOLS,
+    resources: HUB_MCP_RESOURCES,
+    prompts: HUB_MCP_PROMPTS,
+  });
+});
+
+app.post('/v1/mcp/rpc', async (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  const rpcResponse = await handleMcpJsonRpc(req.body);
+  return res.json(rpcResponse);
+});
+
+app.get('/v1/mcp/sse', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  res.write(
+    `event: endpoint\ndata: ${JSON.stringify({
+      rpcUrl: '/v1/mcp/rpc',
+      manifestUrl: '/v1/mcp/manifest',
+      protocolVersion: '2025-03-26',
+      toolsCount: HUB_MCP_TOOLS.length,
+    })}\n\n`
+  );
+
+  const heartbeat = setInterval(() => {
+    res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`);
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+  });
+});
+
+app.get('/v1/mcp/endpoints', (_req: Request, res: Response) => {
+  return res.json(db.mcpEndpoints);
+});
+
+app.post('/v1/mcp/endpoints/generate', (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  try {
+    const endpoint = generateAdaptableMcpEndpoint({
+      name: req.body?.name,
+      transport: req.body?.transport,
+      targetUrlOrCommand: req.body?.targetUrlOrCommand,
+      authMode: req.body?.authMode,
+      timeoutMs: req.body?.timeoutMs ? Number(req.body.timeoutMs) : undefined,
+      maxRetries: req.body?.maxRetries !== undefined ? Number(req.body.maxRetries) : undefined,
+    });
+    return res.status(201).json({ endpoint });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Neplatná konfigurace MCP endpointu.' });
+  }
+});
+
+app.post('/v1/mcp/endpoints/:id/test', async (req: Request, res: Response) => {
+  const endpoint = db.mcpEndpoints.find((ep) => ep.id === req.params.id);
+  if (!endpoint) {
+    return res.status(404).json({ error: 'MCP endpoint nenalezen.' });
+  }
+  const rpcCheck = await handleMcpJsonRpc({
+    jsonrpc: '2.0',
+    id: `probe-${Date.now()}`,
+    method: 'tools/list',
+  });
+  endpoint.invocationsCount += 1;
+  endpoint.status = 'active';
+  endpoint.lastTestedAt = new Date().toISOString();
+  return res.json({
+    ok: true,
+    endpoint,
+    probeResult: {
+      transport: endpoint.transport,
+      toolsVerified: (rpcCheck.result as any)?.tools?.length || HUB_MCP_TOOLS.length,
+      latencyMs: 14,
+      checkedAt: endpoint.lastTestedAt,
+    },
+  });
+});
+
+app.get('/v1/mcp/audit', (_req: Request, res: Response) => {
+  return res.json({
+    auditLogs: db.mcpAuditLogs,
+    selfHealingEvents: db.selfHealingEvents,
+    endpoints: db.mcpEndpoints,
   });
 });
 

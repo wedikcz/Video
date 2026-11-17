@@ -526,6 +526,39 @@ export function generateOpenApi31Spec() {
           },
         },
       },
+      '/api/v1/assets/{asset_id}/preview': {
+        head: {
+          summary: 'Pre-check hlaviček transient preview snippetu (Accept-Ranges, Content-Length, ETag, 202 při generování)',
+          parameters: [{ name: 'asset_id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            '200': { description: 'Hlavičky připraveného náhledu' },
+            '202': { description: 'Asset se právě generuje' },
+          },
+        },
+        get: {
+          summary: 'Získá nebo transientně vygeneruje lehký video/mp4 preview snippet pro hover-to-preview náhledy',
+          parameters: [
+            { name: 'asset_id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'duration', in: 'query', required: false, schema: { type: 'number', example: 2.5 } },
+            { name: 'format', in: 'query', required: false, schema: { type: 'string', enum: ['json', 'video'] } },
+            { name: 'force', in: 'query', required: false, schema: { type: 'string', enum: ['1', 'true'] } },
+          ],
+          responses: {
+            '200': { description: 'Transientní video/mp4 snippet nebo JSON metadata náhledu' },
+            '202': { description: 'Video se ještě renderuje' },
+            '206': { description: 'Byte-Range partial content preview streamu' },
+            '404': { description: 'Asset nenalezen' },
+          },
+        },
+        post: {
+          summary: 'Vynutí vygenerování transient preview snippetu a vrátí metadata včetně URL',
+          parameters: [{ name: 'asset_id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            '201': { description: 'Transient preview snippet úspěšně vygenerován' },
+            '200': { description: 'Existující náhled načten z cache' },
+          },
+        },
+      },
       '/api/v1/assets/{asset_id}/download': {
         get: {
           summary: 'Přímé stažení MP4 souboru s Content-Disposition: attachment',
@@ -799,6 +832,32 @@ export function generateOpenApi31Spec() {
         get: {
           summary: 'Model Context Protocol (MCP) manifest nástrojů pro Genmedia integrace',
           responses: { '200': { description: 'MCP tool definice' } },
+        },
+      },
+      '/v1/multigen/avatars/generate': {
+        post: {
+          summary: 'Generování interaktivního futuristického avatara pro WAN-2.2 nebo LTX-2.5',
+          description:
+            'Zavolá lokální media generation toolkit pro vygenerování futuristického kybernetického avatara s atributací Visual Agentovi.',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    modelId: { type: 'string', enum: ['wan-2-2', 'ltx-2-5', 'nexus-local-director'], example: 'wan-2-2' },
+                    prompt: { type: 'string' },
+                    threadId: { type: 'string' },
+                  },
+                  required: ['modelId'],
+                },
+              },
+            },
+          },
+          responses: {
+            '201': { description: 'Futuristický avatar vygenerován a vrácen jako data URI' },
+          },
         },
       },
     },

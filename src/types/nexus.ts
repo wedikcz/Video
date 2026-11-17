@@ -78,6 +78,33 @@ export interface Message {
   generatedAssets?: FactoryAsset[];
   videoBrief?: VideoCreativeBrief;
   clarificationRequest?: VideoClarificationRequest;
+  reasoningTrace?: ReasoningTrace;
+  videoBatchSuite?: VideoBatchSuite;
+}
+
+export interface VideoBatchSuite {
+  suiteTitle: string;
+  totalDurationSec: number;
+  episodesCount: number;
+  platform: string;
+  targetAudience: string;
+  strategySummary: string;
+}
+
+export interface ReasoningTrace {
+  durationMs: number;
+  thinkingTitle: string;
+  algorithmicStrategy: string;
+  retentionModel: string;
+  audioPacing: string;
+  agentConsensus: Array<{ agent: string; perspective: string }>;
+  structuredPillars: Array<{
+    title: string;
+    subject: string;
+    style: string;
+    camera: string;
+    hookPacing: string;
+  }>;
 }
 
 export interface Thread {
@@ -150,6 +177,7 @@ export interface FactoryAsset {
   moviePyScript?: string;
   videoStoryboard?: VideoStoryboard;
   videoBrief?: VideoCreativeBrief;
+  structuredPrompt?: StructuredVideoPrompt;
   createdAt: string;
   updatedAt?: string;
   dryRun?: boolean;
@@ -213,7 +241,15 @@ export interface VideoCreativeBrief {
   scenes: VideoBriefScene[];
   completenessScore: number;
   missingFields: Array<'topic' | 'platform_format' | 'style_tone' | 'goal_cta' | 'duration'>;
-  engineUsed: 'gemini-4-hydrogen+local-director' | 'local-director-nlp';
+  engineUsed:
+    | 'gemini-4-hydrogen+local-director'
+    | 'gemini-4-hydrogen+thinking-director'
+    | 'local-director-nlp'
+    | 'local-structured-director'
+    | 'nexus-batch-director-suite';
+  notebookStyle?: string;
+  language?: string;
+  structuredPrompt?: StructuredVideoPrompt;
 }
 
 export interface VideoClarificationRequest {
@@ -252,6 +288,7 @@ export interface VideoStoryboard {
   scenes: VideoScene[];
   cta: string;
   affiliateBridge: string;
+  structuredPrompt?: StructuredVideoPrompt;
 }
 
 export interface TraceSpan {
@@ -591,6 +628,7 @@ export interface OpenGenGenerationRequest {
   templateId?: string;
   threadId?: string;
   async?: boolean;
+  structuredPrompt?: StructuredVideoPrompt;
 }
 
 export interface OpenGenGenerationResponse {
@@ -612,5 +650,382 @@ export interface OpenGenGenerationResponse {
   enhancedPrompt?: string;
   storyboard?: VideoStoryboard;
   moviePyScript?: string;
+  structuredPrompt?: StructuredVideoPrompt;
 }
+
+// -------------------------------------------------------------
+// STRUCTURED TEXT-TO-VIDEO PROMPT ENGINE (LOCAL / ZERO-API)
+// -------------------------------------------------------------
+
+export type CameraComposition =
+  | 'close_up'
+  | 'medium_shot'
+  | 'wide_establishing'
+  | 'macro_detail'
+  | 'pov_first_person';
+
+export type LightingPreset =
+  | 'volumetric_neon'
+  | 'golden_hour'
+  | 'studio_rim'
+  | 'dramatic_chiaroscuro'
+  | 'clean_daylight';
+
+export type OpticsPreset =
+  | '35mm_anamorphic'
+  | '50mm_prime'
+  | '85mm_portrait'
+  | '16mm_wide_fpv'
+  | 'macro_100mm';
+
+export type AtmospherePreset =
+  | 'rain_particles'
+  | 'volumetric_dust'
+  | 'light_streaks'
+  | 'clean_studio'
+  | 'data_grid';
+
+export type CameraEasing =
+  | 'linear'
+  | 'ease_in_out'
+  | 'whip_accelerate'
+  | 'handheld_micro';
+
+export type CameraStabilization =
+  | 'gimbal_smooth'
+  | 'tripod_locked'
+  | 'dynamic_fpv'
+  | 'cinematic_dolly';
+
+export type BeatPhase =
+  | 'opening_hook'
+  | 'development'
+  | 'climax_reveal'
+  | 'closing_loop';
+
+export type BeatTransition =
+  | 'cut'
+  | 'crossfade'
+  | 'whip_pan'
+  | 'zoom_punch'
+  | 'glitch_flash';
+
+export type TemporalPacing =
+  | 'explosive_hook'
+  | 'steady_narrative'
+  | 'crescendo_build'
+  | 'hypnotic_loop';
+
+export interface TemporalSceneBeat {
+  id: number;
+  phase: BeatPhase;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  beatTitle: string;
+  sceneDescription: string;
+  subjectEvolution: string;
+  cameraKeyframe: OpenGenCameraMotion;
+  cameraZoomStart: number;
+  cameraZoomEnd: number;
+  cameraPanX: number; // -1 to 1
+  cameraPanY: number; // -1 to 1
+  lightingShift: string;
+  transitionIn: BeatTransition;
+  kineticCaption: string;
+  visualCue: string;
+}
+
+export interface HardcoreRealismProfile {
+  cameraBody: string;
+  shutterAngle: '180deg_cinematic' | '90deg_crisp_action' | '360deg_dreamy';
+  colorPipeline: 'ACES_filmic' | 'ARRI_LogC4' | 'RED_IPP2' | 'Rec709_broadcast';
+  audioLufsTarget: '-14_LUFS_social' | '-16_LUFS_youtube' | '-23_LUFS_cinema';
+  sensorGrain: 'none' | 'fine_35mm' | 'anamorphic_halation';
+}
+
+export interface MonetizationKit {
+  seoTitle: string;
+  hookLine: string;
+  ctaLine: string;
+  brandSafeTags: string[];
+  estimatedRpmTier: string;
+}
+
+export interface StructuredVideoPrompt {
+  version: '2.0';
+  engine: 'local-structured-director';
+  seed: number;
+  rawPrompt: string;
+  aspectRatio: '9:16' | '16:9';
+  totalDurationSec: number;
+  fps: 24 | 30 | 60;
+  subject: {
+    primarySubject: string;
+    subjectAction: string;
+    environment: string;
+    composition: CameraComposition;
+  };
+  style: {
+    visualStyle: VideoVisualStyle;
+    lighting: LightingPreset;
+    optics: OpticsPreset;
+    colorGrading: string;
+    atmosphere: AtmospherePreset;
+    accentColor: string;
+    secondaryColor: string;
+    bgHex: string;
+    negativePrompt: string;
+  };
+  camera: {
+    primaryMotion: OpenGenCameraMotion;
+    motionIntensity: number; // 1 - 10
+    easing: CameraEasing;
+    stabilization: CameraStabilization;
+  };
+  temporal: {
+    pacing: TemporalPacing;
+    beats: TemporalSceneBeat[];
+  };
+  realismProfile?: HardcoreRealismProfile;
+  monetizationKit?: MonetizationKit;
+  activeTagIds?: string[];
+}
+
+export interface StructuredPromptScore {
+  overall: number; // 0 - 100
+  pillars: {
+    subject: number; // 0 - 25
+    style: number; // 0 - 25
+    camera: number; // 0 - 25
+    temporal: number; // 0 - 25
+  };
+  tips: string[];
+}
+
+export type PromptTagCategory = 'camera' | 'style' | 'optics' | 'lighting' | 'atmosphere' | 'realism' | 'monetization';
+
+export interface PromptBuilderTag {
+  id: string;
+  category: PromptTagCategory;
+  label: string;
+  shortLabel: string;
+  promptSnippet: string;
+  description: string;
+  cameraMotion?: OpenGenCameraMotion;
+  motionIntensity?: number;
+  visualStyle?: VideoVisualStyle;
+  optics?: OpticsPreset;
+  lighting?: LightingPreset;
+  atmosphere?: AtmospherePreset;
+  realismPatch?: Partial<HardcoreRealismProfile>;
+  negativeAddition?: string;
+}
+
+export interface MonetizationCheatsheetBlueprint {
+  id: string;
+  title: string;
+  platform: 'YouTube Shorts' | 'YouTube Video' | 'TikTok' | 'Instagram Reels';
+  format: '9:16' | '16:9';
+  rpmTier: string;
+  hookFormula: string;
+  retentionRule: string;
+  adSafetyRule: string;
+  cameraRecipe: string;
+  checklist: string[];
+  rawPrompt: string;
+  structuredPreset: Partial<StructuredVideoPrompt>;
+  monetizationKit: MonetizationKit;
+}
+
+export interface MonetizationCheckItem {
+  id: string;
+  label: string;
+  passed: boolean;
+  detail: string;
+  fixHint?: string;
+}
+
+export interface MonetizationAuditResult {
+  score: number; // 0 - 100
+  is100PercentMonetizable: boolean;
+  adSafe: boolean;
+  checks: MonetizationCheckItem[];
+  recommendedFixLabels: string[];
+}
+
+// -------------------------------------------------------------
+// BATCH PROCESSING QUEUE & AI SMART ENHANCE TYPES
+// -------------------------------------------------------------
+export type BatchQueueItemStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface BatchVideoQueueItem {
+  id: string;
+  title: string;
+  prompt: string;
+  modelId: string;
+  modelName: string;
+  creditCost: number;
+  mode: 'text_to_video' | 'image_to_video' | 'video_to_video';
+  format: '9:16' | '16:9';
+  durationSec: number;
+  fps: 24 | 30 | 60;
+  qualityTier: '720p' | '1080p' | '4K';
+  cameraMotion: OpenGenCameraMotion;
+  motionIntensity: number;
+  visualStyle: VideoVisualStyle;
+  selectedStyleLabel: string;
+  negativePrompt: string;
+  promptMagic: boolean;
+  templateId?: string;
+  structuredPrompt: StructuredVideoPrompt;
+  status: BatchQueueItemStatus;
+  progressPercent: number;
+  progressStage: MediaRenderStage | 'idle';
+  workerMessage: string;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  asset?: FactoryAsset;
+  error?: string;
+}
+
+export interface AiSmartEnhanceResponse {
+  engine: 'gemini-4-hydrogen';
+  model: string;
+  selectedStyleTagLabel: string;
+  expandedRawPrompt: string;
+  structuredPrompt: StructuredVideoPrompt;
+  compiledText: string;
+  cinematicNotes: string[];
+  score: StructuredPromptScore;
+}
+
+// -------------------------------------------------------------
+// SMART AI COMMENTING & 5-CORE GODTIER SWARM TYPES
+// -------------------------------------------------------------
+export type CommentIntent =
+  | 'hot_lead'
+  | 'question'
+  | 'praise'
+  | 'objection'
+  | 'collab'
+  | 'troll_spam';
+
+export type CommentStatus =
+  | 'pending'
+  | 'ai_drafted'
+  | 'auto_replied'
+  | 'published_reply'
+  | 'escalated_lead'
+  | 'shield_blocked';
+
+export type CommentReplyStrategy =
+  | 'hormozi_hook'
+  | 'sales_funnel'
+  | 'authority_guide'
+  | 'witty_shield';
+
+export interface CommentReplyVariant {
+  id: string;
+  strategy: CommentReplyStrategy;
+  label: string;
+  toneBadge: string;
+  replyText: string;
+  predictedCtrLift: string;
+  recommendedCta: string;
+}
+
+export interface CommentMultiCoreAnalysis {
+  intentCore: {
+    intent: CommentIntent;
+    sentimentScore: number; // -100 to +100
+    urgency: 'critical' | 'high' | 'medium' | 'low';
+    viralMultiplier: number; // 0.5 to 3.5x
+    conversionProbability: number; // 0 to 100
+    detectedKeywords: string[];
+  };
+  voiceCore: {
+    voicePersonaLabel: string;
+    replyVariants: CommentReplyVariant[];
+    pinnedCommentSuggestion: string;
+  };
+  shieldCore: {
+    toxicityScore: number; // 0 to 100
+    injectionAttempt: boolean;
+    spamSignals: string[];
+    action: 'allow' | 'neutralize_wit' | 'quarantine';
+    complianceNote: string;
+  };
+  conversionCore: {
+    leadDetected: boolean;
+    funnelStage: 'awareness' | 'consideration' | 'hot_checkout' | 'none';
+    dmTriggerKeyword?: string;
+    suggestedOpportunityTitle?: string;
+    estimatedValueCzk?: number;
+    syncedOpportunityId?: string;
+  };
+  consensusCore: {
+    engineUsed: 'gemini-4-hydrogen+5core-swarm' | 'nexus-godtier-5core-v2';
+    confidenceScore: number; // 0 to 100
+    coreWeights: {
+      intent: number;
+      voice: number;
+      shield: number;
+      conversion: number;
+    };
+    reasoningSummary: string;
+    executionMs: number;
+  };
+}
+
+export interface SocialComment {
+  id: string;
+  assetId?: string;
+  videoTitle: string;
+  platform: VideoSharingPlatform;
+  authorHandle: string;
+  authorBadge?: string;
+  text: string;
+  timestamp: string;
+  likesCount: number;
+  status: CommentStatus;
+  selectedReply?: string;
+  repliedByStrategy?: CommentReplyStrategy;
+  repliedAt?: string;
+  multiCoreAnalysis: CommentMultiCoreAnalysis;
+}
+
+export interface CommentAutopilotConfig {
+  enabled: boolean;
+  voicePersona: 'alex_hormozi_cz' | 'tech_educator' | 'witty_creator' | 'executive_b2b';
+  brandCtaBridge: string;
+  dmKeyword: string;
+  trollShieldMode: 'strict_quarantine' | 'witty_aikido' | 'balanced';
+  autoReplyThresholdConfidence: number; // 0 - 100
+  autoSyncHotLeadsToCrm: boolean;
+}
+
+export interface CommentSwarmKpis {
+  totalComments: number;
+  pendingCount: number;
+  repliedCount: number;
+  hotLeadsCount: number;
+  blockedSpamCount: number;
+  avgSentimentScore: number;
+  unlockedCrmValueCzk: number;
+}
+
+export interface PinnedCommentPack {
+  videoTitle: string;
+  platform: VideoSharingPlatform;
+  pinnedText: string;
+  dmTriggerKeyword: string;
+  abAlternativeText: string;
+  predictedEngagementBoost: string;
+}
+
+
+
+
 

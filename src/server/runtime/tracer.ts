@@ -69,7 +69,7 @@ export class TracerService {
       id: this.runId,
       threadId: this.threadId,
       goal: this.goal,
-      model: 'gpt-5 / gemini-3.8-flash',
+      model: 'nexus-local-orchestrator / gemini-4-hydrogen',
       promptTokens: this.promptTokens,
       completionTokens: this.completionTokens,
       totalTokens,

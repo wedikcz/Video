@@ -604,6 +604,42 @@ export function generateOpenApi31Spec() {
           responses: { '200': { description: 'Aktivní profil přepnut' } },
         },
       },
+      '/v1/comments': {
+        get: {
+          summary: '5jádrový AI Comment Swarm – seznam komentářů, KPI a konfigurace',
+          responses: { '200': { description: 'Seznam komentářů s 5jádrovou analýzou a KPI' } },
+        },
+        post: {
+          summary: 'Příjem nebo simulace nového komentáře s okamžitou 5jádrovou AI analýzou',
+          responses: { '201': { description: 'Komentář uložen a analyzován 5 jádry' } },
+        },
+      },
+      '/v1/comments/swarm/autopilot': {
+        post: {
+          summary: 'Spustí dávkový 5jádrový Swarm Autopilot na čekající komentáře',
+          responses: { '200': { description: 'Souhrn hromadného zpracování, karantény a CRM leadů' } },
+        },
+      },
+      '/v1/comments/{id}/reply': {
+        post: {
+          summary: 'Publikace vybrané AI odpovědi nebo karanténa komentáře',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '200': { description: 'Odpověď publikována' } },
+        },
+      },
+      '/v1/comments/{id}/sync-lead': {
+        post: {
+          summary: 'Synchronizace detekovaného hot leadu z komentáře do CRM (Monetizace)',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '201': { description: 'CRM příležitost vytvořena' } },
+        },
+      },
+      '/v1/comments/pinned/generate': {
+        post: {
+          summary: 'Generátor připnutých DM trigger komentářů pro YouTube, TikTok a Reels',
+          responses: { '200': { description: 'Pinned Comment Pack vygenerován' } },
+        },
+      },
     },
   };
 }

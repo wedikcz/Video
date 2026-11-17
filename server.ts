@@ -44,7 +44,29 @@ import {
   deriveContentRecommendations,
   filterAnalyticsByPlatform,
 } from './src/server/runtime/analyticsInsights.ts';
-import { RolePermission, UserRole, VideoSharingPlatform } from './src/types/nexus.ts';
+import {
+  enhanceStructuredPromptLocally,
+  parseStructuredPromptFromText,
+  scoreStructuredPromptCompleteness,
+} from './src/utils/structuredVideoPrompt.ts';
+import { optimizePromptForMonetization } from './src/utils/monetizationCheatsheets.ts';
+import {
+  AiPromptEnhanceError,
+  enhanceStructuredPromptWithGemini,
+} from './src/server/runtime/aiPromptEnhancer.ts';
+import {
+  analyzeCommentWithMultiCore,
+  generatePinnedCommentPack,
+  pickBestReplyStrategy,
+} from './src/server/runtime/commentIntelligence.ts';
+import {
+  CommentReplyStrategy,
+  RolePermission,
+  SocialComment,
+  StructuredVideoPrompt,
+  UserRole,
+  VideoSharingPlatform,
+} from './src/types/nexus.ts';
 
 dotenv.config();
 
@@ -64,6 +86,17 @@ function checkActorPermission(req: Request, res: Response, permission: RolePermi
     res.status(403).json({
       error: `Přístup odepřen (RBAC): Vaše role (${actor ? ROLE_LABELS[actor.role] : 'Neznámá'}) nemá oprávnění "${PERMISSION_LABELS[permission]}".`,
       requiredPermission: permission,
+    });
+    return false;
+  }
+  return true;
+}
+
+function ensureSystemActive(res: Response): boolean {
+  if (db.isSystemPaused) {
+    res.status(423).json({
+      error: 'NEXUS X OS je aktuálně pozastaven (Nouzový Kill Switch). Obnovte systém v horní liště před spuštěním exekuce.',
+      isSystemPaused: true,
     });
     return false;
   }
@@ -222,6 +255,8 @@ app.get('/v1/boardroom/sessions/:id', (req: Request, res: Response) => {
 });
 
 app.post('/v1/boardroom/sessions', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
   const { topic } = req.body;
   if (!topic) return res.status(400).json({ error: 'Téma zasedání je povinné.' });
 
@@ -239,6 +274,7 @@ app.get('/v1/agents', (req: Request, res: Response) => {
 });
 
 app.patch('/v1/agents/:id', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'manage_team')) return;
   const agent = db.agents.find((a) => a.id === req.params.id);
   if (!agent) return res.status(404).json({ error: 'Agent nenalezen.' });
 
@@ -255,6 +291,7 @@ app.get('/v1/opportunities', (req: Request, res: Response) => {
 });
 
 app.patch('/v1/opportunities/:id', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
   const opp = db.opportunities.find((o) => o.id === req.params.id);
   if (!opp) return res.status(404).json({ error: 'Příležitost nenalezena.' });
 
@@ -264,6 +301,31 @@ app.patch('/v1/opportunities/:id', (req: Request, res: Response) => {
     opp.updatedAt = new Date().toISOString();
   }
   res.json(opp);
+});
+
+app.get('/v1/revenue/autonomous-loop', (_req: Request, res: Response) => {
+  res.json({
+    isAutonomousRevenueLoopActive: db.isAutonomousRevenueLoopActive,
+    isAutonomousLoopActive: db.isAutonomousRevenueLoopActive,
+  });
+});
+
+app.post('/v1/revenue/autonomous-loop', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const next = typeof req.body?.active === 'boolean' ? req.body.active : !db.isAutonomousRevenueLoopActive;
+  db.isAutonomousRevenueLoopActive = next;
+  db.activities.unshift({
+    id: `act-${Date.now()}-revloop`,
+    title: next ? 'Autonomní monetizační smyčka zapnuta' : 'Autonomní monetizační smyčka pozastavena',
+    description: `Operátor přepnul 24/7 ověřování CPC a konverzí na stav: ${next ? 'AKTIVNÍ' : 'VYPNUTO'}.`,
+    agent: 'Revenue Agent',
+    timestamp: new Date().toISOString(),
+    type: 'system',
+  });
+  res.json({
+    isAutonomousRevenueLoopActive: db.isAutonomousRevenueLoopActive,
+    isAutonomousLoopActive: db.isAutonomousRevenueLoopActive,
+  });
 });
 
 // 7. Factory Assets, Media Vault & Video Generations (FFmpeg H.264/AAC + MoviePy)
@@ -685,6 +747,7 @@ app.get('/api/v1/assets/:asset_id/download', async (req: Request, res: Response)
 
 app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
   const {
     topic,
     title,
@@ -694,23 +757,36 @@ app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
     dryRun = false,
     durationSec = 6,
     async: isAsync = false,
-  } = req.body;
+    structuredPrompt,
+  } = req.body as {
+    topic?: string;
+    title?: string;
+    threadId?: string;
+    format?: string;
+    templateId?: string;
+    dryRun?: boolean;
+    durationSec?: number;
+    async?: boolean;
+    structuredPrompt?: StructuredVideoPrompt;
+  };
 
-  const resolvedTopic = (topic || title || '').trim();
+  const resolvedTopic = (topic || title || structuredPrompt?.subject?.primarySubject || '').trim();
   if (!resolvedTopic) {
     return res.status(400).json({ error: 'Parametr topic nebo title je povinný.' });
   }
 
   const template = templateId ? db.userTemplates.find((t) => t.id === templateId) : undefined;
-  const aspectRatio: '9:16' | '16:9' = format === '16:9' ? '16:9' : '9:16';
+  const aspectRatio: '9:16' | '16:9' =
+    structuredPrompt?.aspectRatio || (format === '16:9' ? '16:9' : '9:16');
   const analyzed = await VideoDirectorEngine.analyzePrompt({
     userMessage: `${resolvedTopic} ${aspectRatio}`,
     forceDefaults: true,
+    structuredPrompt,
   });
   const brief = {
     ...analyzed.brief,
     aspectRatio,
-    durationSec: durationSec || analyzed.brief.durationSec,
+    durationSec: structuredPrompt?.totalDurationSec || durationSec || analyzed.brief.durationSec,
     ...(title ? { title } : {}),
   };
 
@@ -727,6 +803,7 @@ app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
     storyboard,
     moviePyScript,
     template,
+    structuredPrompt: brief.structuredPrompt,
     dryRun: Boolean(dryRun),
   });
   db.factoryAssets.unshift(pendingAsset);
@@ -759,6 +836,7 @@ app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
       },
       storyboard,
       moviePyScript,
+      structuredPrompt: brief.structuredPrompt,
     });
   }
 
@@ -789,6 +867,7 @@ app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
 
 app.post('/v1/factory/generations', async (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
   const {
     line,
     topic,
@@ -797,7 +876,17 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
     threadId = 'th-main-001',
     dryRun = false,
     async: isAsync = false,
-  } = req.body;
+    structuredPrompt,
+  } = req.body as {
+    line?: string;
+    topic?: string;
+    format?: string;
+    templateId?: string;
+    threadId?: string;
+    dryRun?: boolean;
+    async?: boolean;
+    structuredPrompt?: StructuredVideoPrompt;
+  };
   if (!line || !topic) return res.status(400).json({ error: 'Line i topic jsou povinné.' });
 
   const template = templateId
@@ -805,11 +894,13 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
     : undefined;
 
   if (line === 'video') {
-    const aspectRatio: '9:16' | '16:9' = format === '16:9' ? '16:9' : '9:16';
+    const aspectRatio: '9:16' | '16:9' =
+      structuredPrompt?.aspectRatio || (format === '16:9' ? '16:9' : '9:16');
     const assetId = `asset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
     const analyzed = await VideoDirectorEngine.analyzePrompt({
       userMessage: `${topic} ${aspectRatio}`,
       forceDefaults: true,
+      structuredPrompt,
     });
     const brief = {
       ...analyzed.brief,
@@ -827,6 +918,7 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
       storyboard,
       moviePyScript,
       template,
+      structuredPrompt: brief.structuredPrompt,
       dryRun: Boolean(dryRun),
     });
     db.factoryAssets.unshift(pendingAsset);
@@ -952,6 +1044,7 @@ app.get('/api/v1/orchestrator/smart-video/trends', async (req: Request, res: Res
 
 app.post('/api/v1/orchestrator/smart-video/analyze-and-trigger', async (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
   try {
     const {
       trendId,
@@ -1082,6 +1175,7 @@ app.get('/api/v1/opengen/credits', (_req: Request, res: Response) => {
 });
 
 app.post('/api/v1/opengen/credits/topup', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
   const { package: pkg = 'creator', amount } = req.body || {};
   let added = Number(amount) || 0;
   if (!added) {
@@ -1108,46 +1202,147 @@ app.post('/api/v1/opengen/credits/topup', (req: Request, res: Response) => {
   });
 });
 
+// 7d. Zero-API Local Structured Text-to-Video Prompt Parser & Enhancer
+app.post('/api/v1/video/structured-prompt/parse', (req: Request, res: Response) => {
+  const { rawPrompt, aspectRatio, durationSec, fps, visualStyle, cameraMotion, motionIntensity, negativePrompt } =
+    req.body || {};
+  if (!rawPrompt || typeof rawPrompt !== 'string') {
+    return res.status(400).json({ error: 'Parametr rawPrompt je povinný.' });
+  }
+  const structuredPrompt = parseStructuredPromptFromText(rawPrompt, {
+    aspectRatio: aspectRatio === '16:9' ? '16:9' : aspectRatio === '9:16' ? '9:16' : undefined,
+    durationSec: typeof durationSec === 'number' ? durationSec : undefined,
+    fps: fps === 24 || fps === 60 || fps === 30 ? fps : undefined,
+    visualStyle,
+    cameraMotion,
+    motionIntensity: typeof motionIntensity === 'number' ? motionIntensity : undefined,
+    negativePrompt: typeof negativePrompt === 'string' ? negativePrompt : undefined,
+  });
+  const score = scoreStructuredPromptCompleteness(structuredPrompt);
+  return res.json({
+    engine: 'local-structured-director',
+    structuredPrompt,
+    score,
+  });
+});
+
+app.post('/api/v1/video/structured-prompt/enhance', (req: Request, res: Response) => {
+  const { structuredPrompt, rawPrompt, cameraMotion, visualStyle, motionIntensity } = req.body || {};
+  const input = structuredPrompt || rawPrompt;
+  if (!input) {
+    return res.status(400).json({ error: 'Zadejte structuredPrompt nebo rawPrompt.' });
+  }
+  const enhanced = enhanceStructuredPromptLocally(input, {
+    cameraMotion,
+    visualStyle,
+    motionIntensity: typeof motionIntensity === 'number' ? motionIntensity : undefined,
+  });
+  const score = scoreStructuredPromptCompleteness(enhanced.structuredPrompt);
+  return res.json({
+    engine: 'local-structured-director',
+    ...enhanced,
+    score,
+  });
+});
+
+app.post('/api/v1/video/structured-prompt/monetize', (req: Request, res: Response) => {
+  const { structuredPrompt, rawPrompt, blueprintId } = req.body || {};
+  const basePrompt =
+    structuredPrompt ||
+    (typeof rawPrompt === 'string' && rawPrompt.trim()
+      ? parseStructuredPromptFromText(rawPrompt)
+      : undefined);
+
+  if (!basePrompt) {
+    return res.status(400).json({ error: 'Zadejte structuredPrompt nebo rawPrompt.' });
+  }
+
+  const result = optimizePromptForMonetization(basePrompt, blueprintId);
+  return res.json({
+    engine: 'local-structured-director',
+    ...result,
+  });
+});
+
+app.post('/api/v1/video/structured-prompt/ai-enhance', async (req: Request, res: Response) => {
+  const { structuredPrompt, rawPrompt, selectedStyleTagId } = req.body || {};
+  try {
+    const result = await enhanceStructuredPromptWithGemini({
+      structuredPrompt,
+      rawPrompt,
+      selectedStyleTagId,
+    });
+    return res.json(result);
+  } catch (err: any) {
+    if (err instanceof AiPromptEnhanceError) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return res.status(500).json({
+      error: err?.message || 'AI Smart Enhance selhal při komunikaci se serverem.',
+    });
+  }
+});
+
 app.post('/api/v1/opengen/prompt-enhance', async (req: Request, res: Response) => {
-  const { prompt, modelId = 'veo-3-1', style = 'cinematic', camera = 'orbit_360' } = req.body || {};
-  if (!prompt || typeof prompt !== 'string') {
-    return res.status(400).json({ error: 'Prompt je povinný řetězec.' });
+  const {
+    prompt,
+    structuredPrompt,
+    modelId = 'nexus-local-director',
+    style,
+    camera = 'orbit_360',
+    motionIntensity,
+  } = req.body || {};
+  if (!prompt && !structuredPrompt) {
+    return res.status(400).json({ error: 'Prompt nebo structuredPrompt je povinný.' });
   }
 
   const modelSpec = db.openGenModels.find((m) => m.id === modelId) || db.openGenModels[0];
-  const cameraNotes =
-    camera === 'orbit_360'
-      ? 'dynamic 360-degree rotational arc orbit'
-      : camera === 'zoom_in'
-      ? 'slow dramatic cinematic push-in dolly zoom'
-      : camera === 'pan_left'
-      ? 'fluid horizontal leftward tracking pan shot'
-      : camera === 'tilt_up'
-      ? 'vertical cinematic tilt-up establishing hero shot'
-      : camera === 'fpv_drone'
-      ? 'high-speed low-altitude dynamic FPV drone glide'
-      : 'locked-off tripod studio precision shot';
+  const localResult = enhanceStructuredPromptLocally(structuredPrompt || String(prompt), {
+    cameraMotion: camera,
+    visualStyle: style,
+    motionIntensity: typeof motionIntensity === 'number' ? motionIntensity : undefined,
+  });
 
-  const enhancedPrompt = `${prompt.trim()}, shot on 35mm anamorphic lens, Arri Alexa 65 format, photorealistic volumetric lighting, raytraced reflections, ${cameraNotes}, rich textures, pristine color grading in neutral film LUT, hyper-detailed, 8k resolution, optimized for ${modelSpec.name}.`;
+  const baseRaw = typeof prompt === 'string' && prompt.trim() ? prompt.trim() : localResult.structuredPrompt.rawPrompt;
+  const enhancedPrompt = `${baseRaw} | 35mm anamorphic optics (Arri Alexa 65 reference), ${camera} camera trajectory, ${localResult.compiledText.replace(/\n/g, ' ')}`;
+  const score = scoreStructuredPromptCompleteness(localResult.structuredPrompt);
 
   return res.json({
-    originalPrompt: prompt,
+    originalPrompt: baseRaw,
     enhancedPrompt,
+    compiledText: localResult.compiledText,
+    structuredPrompt: localResult.structuredPrompt,
+    score,
     modelId: modelSpec.id,
     camera,
-    style,
-    tips: [
-      'Pro nejlepší výsledky specifikujte osvětlení (např. "golden hour" nebo "cyberpunk neon")',
-      'Použijte negativní prompt pro vyřazení artefaktů (např. "blur, watermark, distorted hands")',
-    ],
+    style: localResult.structuredPrompt.style.visualStyle,
+    tips: localResult.tips,
   });
 });
 
 app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+
+  let creditsCharged = 0;
+  const refundChargedCredits = (reason: string) => {
+    if (creditsCharged <= 0) return;
+    db.openGenCredits.available += creditsCharged;
+    db.openGenCredits.usedThisPeriod = Math.max(0, db.openGenCredits.usedThisPeriod - creditsCharged);
+    db.activities.unshift({
+      id: `act-${Date.now()}-refund`,
+      title: `Vráceno +${creditsCharged} OpenGen kreditů`,
+      description: `Automatická kompenzace po neúspěšném renderu: ${reason}`,
+      agent: 'Billing Agent',
+      timestamp: new Date().toISOString(),
+      type: 'system',
+    });
+    creditsCharged = 0;
+  };
+
   try {
     const {
-      modelId = 'veo-3-1',
+      modelId = 'nexus-local-director',
       mode = 'text_to_video',
       prompt,
       negativePrompt,
@@ -1162,16 +1357,17 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       threadId = 'th-main-001',
       dryRun = false,
       async: isAsync = true,
+      structuredPrompt: incomingStructuredPrompt,
     } = req.body || {};
 
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ error: 'Prompt je povinný parametr.' });
+    if ((!prompt || typeof prompt !== 'string') && !incomingStructuredPrompt) {
+      return res.status(400).json({ error: 'Prompt nebo structuredPrompt je povinný parametr.' });
     }
 
     const modelSpec = db.openGenModels.find((m) => m.id === modelId) || db.openGenModels[0];
     const cost = modelSpec.creditCost;
 
-    if (db.openGenCredits.available < cost) {
+    if (cost > 0 && db.openGenCredits.available < cost) {
       return res.status(402).json({
         error: `Nedostatek OpenGen kreditů. Požadováno ${cost} kreditů, máte k dispozici ${db.openGenCredits.available}.`,
         requiredCredits: cost,
@@ -1179,26 +1375,57 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       });
     }
 
-    db.openGenCredits.available -= cost;
-    db.openGenCredits.usedThisPeriod += cost;
+    if (cost > 0) {
+      db.openGenCredits.available -= cost;
+      db.openGenCredits.usedThisPeriod += cost;
+      creditsCharged = cost;
+    }
 
-    const resolvedPrompt = promptMagic
-      ? `${prompt.trim()}, ${cameraMotion} camera trajectory, photorealistic volumetric light, motion intensity ${motionIntensity}/10, rendered with ${modelSpec.name}`
-      : prompt.trim();
+    const normalizedRatio: '9:16' | '16:9' =
+      incomingStructuredPrompt?.aspectRatio === '16:9' || aspectRatio === '16:9' ? '16:9' : '9:16';
+    const normalizedDuration = Math.min(
+      modelSpec.maxDurationSec || 15,
+      Math.max(3, incomingStructuredPrompt?.totalDurationSec || durationSec)
+    );
+
+    const baseStructured =
+      incomingStructuredPrompt ||
+      parseStructuredPromptFromText(String(prompt || ''), {
+        aspectRatio: normalizedRatio,
+        durationSec: normalizedDuration,
+        fps: fps === 24 || fps === 60 ? fps : 30,
+        cameraMotion,
+        motionIntensity,
+        negativePrompt,
+      });
+
+    const finalStructuredPrompt: StructuredVideoPrompt = promptMagic
+      ? enhanceStructuredPromptLocally(baseStructured, {
+          cameraMotion: incomingStructuredPrompt ? undefined : cameraMotion,
+          motionIntensity: incomingStructuredPrompt ? undefined : motionIntensity,
+        }).structuredPrompt
+      : baseStructured;
+
+    const resolvedPrompt =
+      typeof prompt === 'string' && prompt.trim()
+        ? prompt.trim()
+        : finalStructuredPrompt.subject.primarySubject;
 
     const template = templateId
       ? db.userTemplates.find((t) => t.id === templateId)
       : undefined;
 
     const analyzed = await VideoDirectorEngine.analyzePrompt({
-      userMessage: `${resolvedPrompt} ${aspectRatio}`,
+      userMessage: `${resolvedPrompt} ${normalizedRatio}`,
       forceDefaults: true,
+      structuredPrompt: finalStructuredPrompt,
     });
 
     const brief = {
       ...analyzed.brief,
-      aspectRatio,
-      durationSec: Math.min(modelSpec.maxDurationSec, Math.max(3, durationSec)),
+      aspectRatio: normalizedRatio,
+      durationSec: normalizedDuration,
+      structuredPrompt: finalStructuredPrompt,
     };
 
     const storyboard = MoviePyCompiler.createBriefDrivenStoryboard(brief, template);
@@ -1209,11 +1436,12 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       assetId,
       threadId,
       prompt: resolvedPrompt,
-      aspectRatio,
+      aspectRatio: normalizedRatio,
       brief,
       storyboard,
       moviePyScript,
       template,
+      structuredPrompt: finalStructuredPrompt,
       dryRun: Boolean(dryRun),
     });
 
@@ -1222,20 +1450,21 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       'OpenGen',
       modelSpec.name,
       mode,
-      cameraMotion,
+      finalStructuredPrompt.camera.primaryMotion,
       qualityTier,
-      `${fps}fps`,
-      aspectRatio,
+      `${finalStructuredPrompt.fps}fps`,
+      normalizedRatio,
       '+faststart',
+      'StructuredPrompt',
     ];
-    pendingAsset.meta = `OpenGen: ${modelSpec.name} (${mode}, ${cameraMotion}), ${qualityTier} ${aspectRatio} · ${cost} kreditů`;
+    pendingAsset.meta = `${modelSpec.name} · ${finalStructuredPrompt.temporal.beats.length} fází · ${finalStructuredPrompt.camera.primaryMotion} · ${cost === 0 ? 'Lokálně (0 kreditů)' : `${cost} kreditů`}`;
 
     db.factoryAssets.unshift(pendingAsset);
 
     db.activities.unshift({
       id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-      title: `OpenGen: Spuštěn render přes ${modelSpec.name}`,
-      description: `Prompt: "${prompt.slice(0, 50)}..." | ${qualityTier} (${aspectRatio}) | Odečteno: ${cost} kreditů.`,
+      title: `Spuštěn strukturovaný render přes ${modelSpec.name}`,
+      description: `Subjekt: "${finalStructuredPrompt.subject.primarySubject.slice(0, 48)}" | Kamera: ${finalStructuredPrompt.camera.primaryMotion} | ${finalStructuredPrompt.temporal.beats.length} fází.`,
       agent: 'Video Agent',
       timestamp: new Date().toISOString(),
       type: 'action',
@@ -1245,12 +1474,13 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       enqueueBackgroundVideoRenderJob({
         asset: pendingAsset,
         threadId,
-        aspectRatio,
+        aspectRatio: normalizedRatio,
         brief,
         storyboard,
         template,
         topic: resolvedPrompt,
         dryRun: Boolean(dryRun),
+        onJobFailed: (err) => refundChargedCredits(err.message),
       });
       res.setHeader('Retry-After', '1');
       res.setHeader('Cache-Control', 'no-store');
@@ -1273,18 +1503,20 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
         enhancedPrompt: resolvedPrompt,
         storyboard,
         moviePyScript,
+        structuredPrompt: finalStructuredPrompt,
       });
     }
 
     const result = await executeVideoRenderJob({
       asset: pendingAsset,
       threadId,
-      aspectRatio,
+      aspectRatio: normalizedRatio,
       brief,
       storyboard,
       template,
       topic: resolvedPrompt,
       dryRun: Boolean(dryRun),
+      onJobFailed: (err) => refundChargedCredits(err.message),
     });
 
     return res.status(201).json({
@@ -1301,8 +1533,10 @@ app.post('/api/v1/opengen/generate', async (req: Request, res: Response) => {
       faststartVerified: Boolean(result.asset.faststartVerified),
       storyboard,
       moviePyScript,
+      structuredPrompt: finalStructuredPrompt,
     });
   } catch (err: any) {
+    refundChargedCredits(err?.message || 'Neočekávaná chyba OpenGen workeru');
     return res.status(500).json({ error: `OpenGen generování selhalo: ${err.message}` });
   }
 });
@@ -1322,6 +1556,7 @@ app.get('/v1/metrics/summary', (req: Request, res: Response) => {
     budgetSpentCzk: db.totalCzkBudgetSpent,
     dailyBudgetLimitCzk: db.dailyCzkBudgetLimit,
     isSystemPaused: db.isSystemPaused,
+    isAutonomousRevenueLoopActive: db.isAutonomousRevenueLoopActive,
   });
 });
 
@@ -1431,6 +1666,7 @@ app.get('/v1/publish/tasks', (req: Request, res: Response) => {
 
 app.post('/v1/publish', (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'publish_videos')) return;
+  if (!ensureSystemActive(res)) return;
   const { assetId, videoTitle, platforms, scheduledFor, metadata, format = '9:16', templateCategory = 'viral_hook' } = req.body;
   if (!videoTitle || !platforms || platforms.length === 0) {
     return res.status(400).json({ error: 'videoTitle a alespoň jedna platforma jsou povinné.' });
@@ -1801,6 +2037,314 @@ app.post('/v1/team/switch-actor', (req: Request, res: Response) => {
   res.json({ currentActor: member });
 });
 
+// 18. Smart AI Commenting & 5-Core Godtier Swarm Endpoints
+app.get('/v1/comments', (req: Request, res: Response) => {
+  const platform = req.query.platform as string | undefined;
+  const status = req.query.status as string | undefined;
+  const intent = req.query.intent as string | undefined;
+
+  let filtered = [...db.comments];
+  if (platform && platform !== 'all') {
+    filtered = filtered.filter((c) => c.platform === platform);
+  }
+  if (status && status !== 'all') {
+    filtered = filtered.filter((c) => c.status === status);
+  }
+  if (intent && intent !== 'all') {
+    filtered = filtered.filter((c) => c.multiCoreAnalysis.intentCore.intent === intent);
+  }
+
+  filtered.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  res.json({
+    comments: filtered,
+    kpis: db.getCommentSwarmKpis(),
+    config: db.commentAutopilotConfig,
+  });
+});
+
+app.post('/v1/comments', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const {
+    text,
+    authorHandle = '@divak_nexus',
+    platform = 'YouTube',
+    videoTitle = 'AI Video Studio 2026',
+    assetId,
+    likesCount = 1,
+  } = req.body || {};
+
+  if (!text || typeof text !== 'string' || text.trim().length < 2) {
+    return res.status(400).json({ error: 'Text komentáře je povinný.' });
+  }
+
+  const normalizedPlatform: VideoSharingPlatform =
+    platform === 'TikTok' || platform === 'Instagram Reels' ? platform : 'YouTube';
+  const normalizedAuthor = String(authorHandle).trim().startsWith('@')
+    ? String(authorHandle).trim()
+    : `@${String(authorHandle).trim()}`;
+
+  const draft: Omit<SocialComment, 'multiCoreAnalysis'> = {
+    id: `cmt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+    assetId: typeof assetId === 'string' ? assetId : undefined,
+    videoTitle: String(videoTitle).trim() || 'AI Video Studio 2026',
+    platform: normalizedPlatform,
+    authorHandle: normalizedAuthor,
+    text: text.trim(),
+    timestamp: new Date().toISOString(),
+    likesCount: Math.max(0, Number(likesCount) || 0),
+    status: 'pending',
+  };
+
+  const analysis = await analyzeCommentWithMultiCore(draft, db.commentAutopilotConfig);
+  const newComment: SocialComment = {
+    ...draft,
+    status: analysis.shieldCore.action === 'quarantine' ? 'shield_blocked' : 'pending',
+    multiCoreAnalysis: analysis,
+  };
+
+  db.comments.unshift(newComment);
+
+  db.activities.unshift({
+    id: `act-${Date.now()}-cmt`,
+    title:
+      newComment.status === 'shield_blocked'
+        ? `Troll-Shield izoloval komentář: ${newComment.authorHandle}`
+        : `Nový komentář (${newComment.platform}): ${newComment.authorHandle}`,
+    description: analysis.consensusCore.reasoningSummary,
+    agent: newComment.status === 'shield_blocked' ? 'CTO Agent' : 'CMO Agent',
+    timestamp: new Date().toISOString(),
+    type: newComment.status === 'shield_blocked' ? 'system' : 'action',
+  });
+
+  res.status(201).json({
+    comment: newComment,
+    kpis: db.getCommentSwarmKpis(),
+  });
+});
+
+app.post('/v1/comments/:id/analyze', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const comment = db.comments.find((c) => c.id === req.params.id);
+  if (!comment) {
+    return res.status(404).json({ error: 'Komentář nebyl nalezen.' });
+  }
+
+  const { voicePersona } = req.body || {};
+  const configOverride = voicePersona
+    ? { ...db.commentAutopilotConfig, voicePersona }
+    : db.commentAutopilotConfig;
+
+  const prevSyncedId = comment.multiCoreAnalysis.conversionCore.syncedOpportunityId;
+  comment.multiCoreAnalysis = await analyzeCommentWithMultiCore(comment, configOverride);
+  if (prevSyncedId) {
+    comment.multiCoreAnalysis.conversionCore.syncedOpportunityId = prevSyncedId;
+  }
+  if (comment.multiCoreAnalysis.shieldCore.action === 'quarantine') {
+    comment.status = 'shield_blocked';
+  } else if (comment.status === 'pending') {
+    comment.status = 'ai_drafted';
+  }
+
+  res.json({
+    comment,
+    kpis: db.getCommentSwarmKpis(),
+  });
+});
+
+app.post('/v1/comments/:id/reply', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'publish_videos')) return;
+  const comment = db.comments.find((c) => c.id === req.params.id);
+  if (!comment) {
+    return res.status(404).json({ error: 'Komentář nebyl nalezen.' });
+  }
+
+  const { replyText, strategy, quarantine = false, syncLead = false } = req.body || {};
+
+  if (quarantine) {
+    comment.status = 'shield_blocked';
+    comment.selectedReply = '[KARANTÉNA] Komentář byl skryt modulem Core 3 Troll-Shield.';
+    comment.repliedAt = new Date().toISOString();
+    return res.json({
+      comment,
+      kpis: db.getCommentSwarmKpis(),
+    });
+  }
+
+  const pickedVariant = pickBestReplyStrategy(
+    comment.multiCoreAnalysis,
+    strategy as CommentReplyStrategy | undefined
+  );
+  const finalReply =
+    typeof replyText === 'string' && replyText.trim()
+      ? replyText.trim()
+      : pickedVariant?.replyText || '';
+
+  if (!finalReply) {
+    return res.status(400).json({ error: 'Text odpovědi nesmí být prázdný.' });
+  }
+
+  comment.selectedReply = finalReply;
+  comment.repliedByStrategy = (strategy as CommentReplyStrategy) || pickedVariant?.strategy || 'hormozi_hook';
+  comment.repliedAt = new Date().toISOString();
+  comment.status = 'published_reply';
+
+  let syncedOpportunity = null;
+  if (syncLead || (db.commentAutopilotConfig.autoSyncHotLeadsToCrm && comment.multiCoreAnalysis.intentCore.intent === 'hot_lead')) {
+    const syncRes = db.syncCommentLeadToCrm(comment.id);
+    syncedOpportunity = syncRes?.opportunity || null;
+  }
+
+  db.activities.unshift({
+    id: `act-${Date.now()}-reply`,
+    title: `Odeslána AI odpověď (${comment.platform}): ${comment.authorHandle}`,
+    description: `Strategie ${comment.repliedByStrategy}: "${finalReply.slice(0, 90)}"`,
+    agent: 'CMO Agent',
+    timestamp: new Date().toISOString(),
+    type: 'action',
+  });
+
+  res.json({
+    comment,
+    syncedOpportunity,
+    kpis: db.getCommentSwarmKpis(),
+  });
+});
+
+app.post('/v1/comments/:id/sync-lead', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const syncRes = db.syncCommentLeadToCrm(req.params.id);
+  if (!syncRes) {
+    return res.status(404).json({ error: 'Komentář nebyl nalezen.' });
+  }
+  res.status(201).json({
+    ...syncRes,
+    kpis: db.getCommentSwarmKpis(),
+  });
+});
+
+app.post('/v1/comments/swarm/autopilot', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'publish_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  const {
+    strategy = 'hormozi_hook',
+    syncLeads = db.commentAutopilotConfig.autoSyncHotLeadsToCrm,
+    platform = 'all',
+  } = req.body || {};
+
+  const candidates = db.comments.filter((c) => {
+    if (platform !== 'all' && c.platform !== platform) return false;
+    return c.status === 'pending' || c.status === 'ai_drafted';
+  });
+
+  let repliedCount = 0;
+  let blockedCount = 0;
+  let leadsSyncedCount = 0;
+
+  for (const comment of candidates) {
+    const prevSyncedId = comment.multiCoreAnalysis.conversionCore.syncedOpportunityId;
+    comment.multiCoreAnalysis = await analyzeCommentWithMultiCore(comment, db.commentAutopilotConfig);
+    if (prevSyncedId) {
+      comment.multiCoreAnalysis.conversionCore.syncedOpportunityId = prevSyncedId;
+    }
+
+    if (comment.multiCoreAnalysis.shieldCore.action === 'quarantine') {
+      comment.status = 'shield_blocked';
+      blockedCount += 1;
+      continue;
+    }
+
+    const picked = pickBestReplyStrategy(comment.multiCoreAnalysis, strategy as CommentReplyStrategy);
+    if (picked) {
+      comment.selectedReply = picked.replyText;
+      comment.repliedByStrategy = picked.strategy;
+      comment.repliedAt = new Date().toISOString();
+      comment.status = 'auto_replied';
+      repliedCount += 1;
+    }
+
+    if (syncLeads && comment.multiCoreAnalysis.conversionCore.leadDetected) {
+      db.syncCommentLeadToCrm(comment.id);
+      leadsSyncedCount += 1;
+    }
+  }
+
+  db.activities.unshift({
+    id: `act-${Date.now()}-autopilot`,
+    title: `5jádrový Swarm Autopilot dokončen (${repliedCount} odpovědí)`,
+    description: `Zpracováno ${candidates.length} čekajících komentářů: ${repliedCount} odpovězeno, ${blockedCount} v karanténě, ${leadsSyncedCount} CRM leadů.`,
+    agent: 'CMO Agent',
+    timestamp: new Date().toISOString(),
+    type: 'action',
+  });
+
+  res.json({
+    processedCount: candidates.length,
+    repliedCount,
+    blockedCount,
+    leadsSyncedCount,
+    comments: db.comments,
+    kpis: db.getCommentSwarmKpis(),
+  });
+});
+
+app.post('/v1/comments/pinned/generate', (req: Request, res: Response) => {
+  const { videoTitle, platform = 'YouTube', dmKeyword } = req.body || {};
+  if (!videoTitle || typeof videoTitle !== 'string') {
+    return res.status(400).json({ error: 'Název videa je povinný.' });
+  }
+  const pack = generatePinnedCommentPack({
+    videoTitle,
+    platform,
+    dmKeyword: dmKeyword || db.commentAutopilotConfig.dmKeyword,
+  });
+  res.json(pack);
+});
+
+app.patch('/v1/comments/config', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const {
+    enabled,
+    voicePersona,
+    brandCtaBridge,
+    dmKeyword,
+    trollShieldMode,
+    autoReplyThresholdConfidence,
+    autoSyncHotLeadsToCrm,
+  } = req.body || {};
+
+  if (typeof enabled === 'boolean') db.commentAutopilotConfig.enabled = enabled;
+  if (
+    voicePersona &&
+    ['alex_hormozi_cz', 'tech_educator', 'witty_creator', 'executive_b2b'].includes(voicePersona)
+  ) {
+    db.commentAutopilotConfig.voicePersona = voicePersona;
+  }
+  if (typeof brandCtaBridge === 'string' && brandCtaBridge.trim()) {
+    db.commentAutopilotConfig.brandCtaBridge = brandCtaBridge.trim();
+  }
+  if (typeof dmKeyword === 'string' && dmKeyword.trim()) {
+    db.commentAutopilotConfig.dmKeyword = dmKeyword.trim().toUpperCase().slice(0, 24);
+  }
+  if (
+    trollShieldMode &&
+    ['strict_quarantine', 'witty_aikido', 'balanced'].includes(trollShieldMode)
+  ) {
+    db.commentAutopilotConfig.trollShieldMode = trollShieldMode;
+  }
+  if (typeof autoReplyThresholdConfidence === 'number') {
+    db.commentAutopilotConfig.autoReplyThresholdConfidence = Math.max(
+      50,
+      Math.min(99, Math.round(autoReplyThresholdConfidence))
+    );
+  }
+  if (typeof autoSyncHotLeadsToCrm === 'boolean') {
+    db.commentAutopilotConfig.autoSyncHotLeadsToCrm = autoSyncHotLeadsToCrm;
+  }
+
+  res.json({ config: db.commentAutopilotConfig });
+});
+
 // Vite middleware in dev or static files in production
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
@@ -1827,8 +2371,9 @@ async function startServer() {
 const isTestMode =
   process.env.NODE_ENV === 'test' ||
   process.env.NEXUS_SKIP_LISTEN === '1' ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
   process.execArgv.some((arg) => arg.includes('test')) ||
-  process.argv.some((arg) => arg === '--test');
+  process.argv.some((arg) => arg === '--test' || arg.includes('.test.'));
 
 if (!isTestMode) {
   startServer();

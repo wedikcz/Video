@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Coins,
   TrendingUp,
@@ -17,6 +17,7 @@ import {
   Filter,
   DollarSign,
   Activity,
+  AlertTriangle,
 } from 'lucide-react';
 import { Opportunity, Activity as ActivityType } from '../types/nexus.ts';
 
@@ -36,6 +37,53 @@ export const RevenueView: React.FC<RevenueViewProps> = ({
 }) => {
   const [statusFilter, setStatusFilter] = useState<'all' | 'new' | 'active' | 'won' | 'paused'>('all');
   const [isAutonomousLoopActive, setIsAutonomousLoopActive] = useState(true);
+  const [isSavingLoop, setIsSavingLoop] = useState(false);
+  const [loopError, setLoopError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/v1/revenue/autonomous-loop')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (active && data && typeof data.isAutonomousRevenueLoopActive === 'boolean') {
+          setIsAutonomousLoopActive(data.isAutonomousRevenueLoopActive);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleToggleAutonomousLoop = async () => {
+    if (isSavingLoop) return;
+    const prev = isAutonomousLoopActive;
+    const next = !prev;
+    setLoopError(null);
+    setIsAutonomousLoopActive(next);
+    setIsSavingLoop(true);
+    try {
+      const res = await fetch('/v1/revenue/autonomous-loop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setIsAutonomousLoopActive(prev);
+        setLoopError(data.error || 'Změna stavu autonomní smyčky selhala.');
+        return;
+      }
+      if (typeof data.isAutonomousRevenueLoopActive === 'boolean') {
+        setIsAutonomousLoopActive(data.isAutonomousRevenueLoopActive);
+      }
+    } catch (err: any) {
+      setIsAutonomousLoopActive(prev);
+      setLoopError(err?.message || 'Síťová chyba při ukládání stavu autonomní smyčky.');
+    } finally {
+      setIsSavingLoop(false);
+    }
+  };
 
   const totalPipeline = opportunities.reduce(
     (acc, o) => acc + (o.status !== 'closed' ? o.projectionCzk : 0),
@@ -56,6 +104,25 @@ export const RevenueView: React.FC<RevenueViewProps> = ({
 
   return (
     <div className="min-h-[calc(100vh-3.5rem)] w-full bg-zinc-950 p-4 sm:p-6 space-y-6">
+      {loopError && (
+        <div
+          data-testid="revenue-loop-error"
+          className="flex items-center justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-950/30 px-4 py-2.5 text-xs font-mono text-rose-300"
+        >
+          <span className="flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>{loopError}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setLoopError(null)}
+            className="text-rose-200 hover:text-white underline"
+          >
+            Zavřít
+          </button>
+        </div>
+      )}
+
       {/* 4 KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* KPI 1 */}
@@ -111,8 +178,11 @@ export const RevenueView: React.FC<RevenueViewProps> = ({
               {isAutonomousLoopActive ? 'BĚŽÍ 24/7' : 'POZASTAVENO'}
             </span>
             <button
-              onClick={() => setIsAutonomousLoopActive(!isAutonomousLoopActive)}
-              className={`rounded px-2.5 py-1 text-[10px] font-mono font-bold transition ${
+              type="button"
+              data-testid="toggle-autonomous-loop-btn"
+              disabled={isSavingLoop}
+              onClick={handleToggleAutonomousLoop}
+              className={`rounded px-2.5 py-1 text-[10px] font-mono font-bold transition disabled:opacity-50 ${
                 isAutonomousLoopActive
                   ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   : 'bg-zinc-800 text-zinc-400'
@@ -145,30 +215,35 @@ export const RevenueView: React.FC<RevenueViewProps> = ({
             {/* Filter buttons */}
             <div className="flex items-center rounded border border-zinc-800 bg-zinc-900 p-0.5 text-xs font-mono">
               <button
+                data-testid="filter-opp-all"
                 onClick={() => setStatusFilter('all')}
                 className={`rounded px-2.5 py-1 ${statusFilter === 'all' ? 'bg-zinc-800 text-white font-bold' : 'text-zinc-400'}`}
               >
                 Vše
               </button>
               <button
+                data-testid="filter-opp-active"
                 onClick={() => setStatusFilter('active')}
                 className={`rounded px-2.5 py-1 ${statusFilter === 'active' ? 'bg-zinc-800 text-emerald-400 font-bold' : 'text-zinc-400'}`}
               >
                 Aktivní
               </button>
               <button
+                data-testid="filter-opp-new"
                 onClick={() => setStatusFilter('new')}
                 className={`rounded px-2.5 py-1 ${statusFilter === 'new' ? 'bg-zinc-800 text-cyan-400 font-bold' : 'text-zinc-400'}`}
               >
                 Nové
               </button>
               <button
+                data-testid="filter-opp-won"
                 onClick={() => setStatusFilter('won')}
                 className={`rounded px-2.5 py-1 ${statusFilter === 'won' ? 'bg-zinc-800 text-amber-400 font-bold' : 'text-zinc-400'}`}
               >
                 Won
               </button>
               <button
+                data-testid="filter-opp-paused"
                 onClick={() => setStatusFilter('paused')}
                 className={`rounded px-2.5 py-1 ${statusFilter === 'paused' ? 'bg-zinc-800 text-zinc-400 font-bold' : 'text-zinc-400'}`}
               >

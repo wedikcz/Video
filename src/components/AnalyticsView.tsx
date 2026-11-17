@@ -29,6 +29,7 @@ import {
   PublishedVideoMetric,
   VideoSharingPlatform,
 } from '../types/nexus.ts';
+import { copyTextSafely } from '../utils/clipboard.ts';
 
 interface AnalyticsViewProps {
   onSelectTrendForVideo: (trendTopic: string, templateId?: string) => void;
@@ -78,7 +79,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ onSelectTrendForVi
     }
   };
 
-  const handleCopyReport = () => {
+  const handleCopyReport = async () => {
     if (!analytics) return;
     const activeSummary = analytics.filteredSummary || analytics.summary;
     const report = `# NEXUS X OS · Souhrnný Analytický Report (${platformFilter === 'all' ? 'YouTube + TikTok + Instagram Reels' : platformFilter})
@@ -96,9 +97,11 @@ ${analytics.contentRecommendations
   .map((r) => `- [${r.platform}] ${r.recommendedTopic} (${r.expectedLift})`)
   .join('\n')}
 `;
-    navigator.clipboard.writeText(report);
-    setCopiedReport(true);
-    setTimeout(() => setCopiedReport(false), 2000);
+    const ok = await copyTextSafely(report);
+    if (ok) {
+      setCopiedReport(true);
+      setTimeout(() => setCopiedReport(false), 2000);
+    }
   };
 
   const getPlatformIcon = (platform: VideoSharingPlatform) => {
@@ -149,6 +152,7 @@ ${analytics.contentRecommendations
               <button
                 key={plat}
                 type="button"
+                data-testid={`platform-filter-${plat.toLowerCase().replace(/\s+/g, '-')}`}
                 onClick={() => setPlatformFilter(plat)}
                 className={`rounded px-2.5 py-1 whitespace-nowrap transition ${
                   platformFilter === plat
@@ -322,6 +326,7 @@ ${analytics.contentRecommendations
 
               <button
                 type="button"
+                data-testid="recommendation-create-video-btn"
                 onClick={() => onSelectTrendForVideo(rec.recommendedTopic, rec.recommendedTemplateId)}
                 className="w-full flex items-center justify-center gap-1.5 rounded bg-emerald-500 px-3 py-2 text-xs font-bold text-black hover:bg-emerald-400 transition"
               >
@@ -425,6 +430,7 @@ ${analytics.contentRecommendations
               <div className="flex items-center rounded border border-zinc-800 bg-zinc-950 p-0.5 text-xs font-mono">
                 <button
                   type="button"
+                  data-testid="timeline-metric-views"
                   onClick={() => setSelectedTimelineMetric('views')}
                   className={`rounded px-2 py-1 ${
                     selectedTimelineMetric === 'views' ? 'bg-zinc-800 text-emerald-400 font-bold' : 'text-zinc-400'
@@ -434,6 +440,7 @@ ${analytics.contentRecommendations
                 </button>
                 <button
                   type="button"
+                  data-testid="timeline-metric-likes"
                   onClick={() => setSelectedTimelineMetric('likes')}
                   className={`rounded px-2 py-1 ${
                     selectedTimelineMetric === 'likes' ? 'bg-zinc-800 text-rose-400 font-bold' : 'text-zinc-400'
@@ -443,6 +450,7 @@ ${analytics.contentRecommendations
                 </button>
                 <button
                   type="button"
+                  data-testid="timeline-metric-comments"
                   onClick={() => setSelectedTimelineMetric('comments')}
                   className={`rounded px-2 py-1 ${
                     selectedTimelineMetric === 'comments' ? 'bg-zinc-800 text-cyan-400 font-bold' : 'text-zinc-400'
@@ -452,6 +460,7 @@ ${analytics.contentRecommendations
                 </button>
                 <button
                   type="button"
+                  data-testid="timeline-metric-watch"
                   onClick={() => setSelectedTimelineMetric('watchTimeHours')}
                   className={`rounded px-2 py-1 ${
                     selectedTimelineMetric === 'watchTimeHours' ? 'bg-zinc-800 text-amber-400 font-bold' : 'text-zinc-400'

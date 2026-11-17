@@ -31,22 +31,26 @@ export const BoardroomView: React.FC<BoardroomViewProps> = ({ agents, onToggleAg
   const [selectedRound, setSelectedRound] = useState<'round1' | 'round2' | 'round3'>('round3');
   const [agentFilter, setAgentFilter] = useState<'all' | 'active' | 'paused'>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [boardroomError, setBoardroomError] = useState<string | null>(null);
 
   const handleStartBoardroom = async () => {
     if (!topic.trim() || isDebating) return;
     setIsDebating(true);
+    setBoardroomError(null);
     try {
       const res = await fetch('/v1/boardroom/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setCurrentSession(data);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setBoardroomError(data.error || 'Spuštění debaty Boardroomu selhalo.');
+        return;
       }
-    } catch (err) {
-      console.error('Failed to run boardroom session', err);
+      setCurrentSession(data);
+    } catch (err: any) {
+      setBoardroomError(err?.message || 'Síťová chyba při spuštění debaty Boardroomu.');
     } finally {
       setIsDebating(false);
     }
@@ -137,6 +141,25 @@ export const BoardroomView: React.FC<BoardroomViewProps> = ({ agents, onToggleAg
           </div>
         </div>
       </div>
+
+      {boardroomError && (
+        <div
+          data-testid="boardroom-error"
+          className="flex items-center justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-950/30 px-4 py-2.5 text-xs font-mono text-rose-300"
+        >
+          <span className="flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>{boardroomError}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setBoardroomError(null)}
+            className="text-rose-200 hover:text-white underline"
+          >
+            Zavřít
+          </button>
+        </div>
+      )}
 
       {/* Boardroom Session Result */}
       {currentSession && (

@@ -10,12 +10,18 @@ import { BoardroomView } from './components/BoardroomView.tsx';
 import { RevenueView } from './components/RevenueView.tsx';
 import { FactoryView } from './components/FactoryView.tsx';
 import { MediaVaultView } from './components/MediaVaultView.tsx';
+import { CommentSwarmView } from './components/CommentSwarmView.tsx';
 import { AnalyticsView } from './components/AnalyticsView.tsx';
 import { AccountsTeamView } from './components/AccountsTeamView.tsx';
 import { PublishModal } from './components/PublishModal.tsx';
 import { TraceDrawer } from './components/TraceDrawer.tsx';
 import { EvalsModal } from './components/EvalsModal.tsx';
 import { DocsModal } from './components/DocsModal.tsx';
+import {
+  NotebookLMStudioModal,
+  NotebookLMStudioConfig,
+  buildNotebookLMPrompt,
+} from './components/NotebookLMStudioModal.tsx';
 import {
   Agent,
   Opportunity,
@@ -41,12 +47,18 @@ export default function App() {
   const [isTraceOpen, setIsTraceOpen] = useState(false);
   const [isEvalsOpen, setIsEvalsOpen] = useState(false);
   const [isDocsOpen, setIsDocsOpen] = useState(false);
+  const [isNotebookLMOpen, setIsNotebookLMOpen] = useState(false);
+  const [pendingChatPrompt, setPendingChatPrompt] = useState<string | null>(null);
+  const [systemNotice, setSystemNotice] = useState<string | null>(null);
 
   // Social Publishing & CMS Modal State
   const [isPublishOpen, setIsPublishOpen] = useState(false);
   const [publishVideoTitle, setPublishVideoTitle] = useState('YouTube Viral Short: AI automatizace');
+  const [publishAssetId, setPublishAssetId] = useState<string>('asset-001');
   const [publishFormat, setPublishFormat] = useState<'9:16' | '16:9'>('9:16');
   const [publishCategory, setPublishCategory] = useState<VideoTemplateCategory>('viral_hook');
+  const [publishDescription, setPublishDescription] = useState<string | undefined>(undefined);
+  const [publishTags, setPublishTags] = useState<string | undefined>(undefined);
 
   // Viral Trend / Analytics Recommendation to Video Factory Bridge & Media Vault Focus
   const [factoryInitialTopic, setFactoryInitialTopic] = useState<string | undefined>(undefined);
@@ -113,40 +125,65 @@ export default function App() {
     }
   };
 
+  const refreshOpportunities = async () => {
+    try {
+      const res = await fetch('/v1/opportunities');
+      if (res.ok) setOpportunities(await res.json());
+    } catch (err) {
+      console.error('Failed to refresh opportunities', err);
+    }
+  };
+
+  const refreshActivities = async () => {
+    try {
+      const res = await fetch('/v1/activity');
+      if (res.ok) setActivities(await res.json());
+    } catch (err) {
+      console.error('Failed to refresh activities', err);
+    }
+  };
+
   const handleOpenVaultAsset = (assetId: string) => {
     setFocusedVaultAssetId(assetId);
     setActiveTab('vault');
   };
 
   const handleToggleSystemPause = async () => {
+    setSystemNotice(null);
     try {
       const res = await fetch('/v1/system/pause', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setIsSystemPaused(data.isSystemPaused);
-        const actsRes = await fetch('/v1/activity');
-        if (actsRes.ok) setActivities(await actsRes.json());
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSystemNotice(data.error || 'Přepnutí nouzového Kill Switch selhalo.');
+        return;
       }
-    } catch (err) {
-      console.error('Failed to toggle system pause', err);
+      setIsSystemPaused(data.isSystemPaused);
+      const actsRes = await fetch('/v1/activity');
+      if (actsRes.ok) setActivities(await actsRes.json());
+    } catch (err: any) {
+      setSystemNotice(err?.message || 'Síťová chyba při přepínání Kill Switch.');
     }
   };
 
   const handleToggleAgentStatus = async (agentId: string, currentStatus: 'active' | 'paused') => {
     const newStatus = currentStatus === 'active' ? 'paused' : 'active';
+    setSystemNotice(null);
     try {
       const res = await fetch(`/v1/agents/${agentId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),
       });
-      if (res.ok) {
-        setAgents((prev) =>
-          prev.map((a) => (a.id === agentId ? { ...a, status: newStatus } : a))
-        );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSystemNotice(data.error || 'Změna stavu agenta byla zamítnuta.');
+        return;
       }
-    } catch (err) {
-      console.error('Failed to update agent status', err);
+      setAgents((prev) =>
+        prev.map((a) => (a.id === agentId ? { ...a, status: newStatus } : a))
+      );
+    } catch (err: any) {
+      setSystemNotice(err?.message || 'Síťová chyba při změně stavu agenta.');
     }
   };
 
@@ -154,19 +191,23 @@ export default function App() {
     id: string,
     status: 'new' | 'active' | 'won' | 'paused' | 'closed'
   ) => {
+    setSystemNotice(null);
     try {
       const res = await fetch(`/v1/opportunities/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
       });
-      if (res.ok) {
-        setOpportunities((prev) =>
-          prev.map((o) => (o.id === id ? { ...o, status, updatedAt: new Date().toISOString() } : o))
-        );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSystemNotice(data.error || 'Aktualizace příležitosti byla zamítnuta.');
+        return;
       }
-    } catch (err) {
-      console.error('Failed to update opportunity status', err);
+      setOpportunities((prev) =>
+        prev.map((o) => (o.id === id ? { ...o, status, updatedAt: new Date().toISOString() } : o))
+      );
+    } catch (err: any) {
+      setSystemNotice(err?.message || 'Síťová chyba při aktualizaci příležitosti.');
     }
   };
 
@@ -178,11 +219,15 @@ export default function App() {
   const handleOpenPublish = (
     videoTitle?: string,
     format: '9:16' | '16:9' = '9:16',
-    category: VideoTemplateCategory = 'viral_hook'
+    category: VideoTemplateCategory = 'viral_hook',
+    extra?: { assetId?: string; description?: string; tags?: string[] }
   ) => {
     if (videoTitle) setPublishVideoTitle(videoTitle);
     setPublishFormat(format);
     setPublishCategory(category);
+    setPublishAssetId(extra?.assetId || 'asset-001');
+    setPublishDescription(extra?.description);
+    setPublishTags(extra?.tags?.join(', '));
     setIsPublishOpen(true);
   };
 
@@ -190,6 +235,13 @@ export default function App() {
     setFactoryInitialTopic(trendTopic);
     setFactoryInitialTemplateId(templateId);
     setActiveTab('factory');
+  };
+
+  const handleGenerateFromNotebookLM = (config: NotebookLMStudioConfig) => {
+    const prompt = buildNotebookLMPrompt(config);
+    setIsNotebookLMOpen(false);
+    setActiveTab('chat');
+    setPendingChatPrompt(prompt);
   };
 
   const activeAccount = accounts.find((a) => a.id === activeAccountId);
@@ -205,6 +257,7 @@ export default function App() {
         onOpenDocs={() => setIsDocsOpen(true)}
         onOpenEvals={() => setIsEvalsOpen(true)}
         onOpenPublish={() => handleOpenPublish()}
+        onOpenNotebookLM={() => setIsNotebookLMOpen(true)}
         activeAgentsCount={agents.filter((a) => a.status === 'active').length}
         activeAccount={activeAccount}
         currentActor={currentActor}
@@ -212,6 +265,21 @@ export default function App() {
 
       {/* Main View Routes */}
       <main className="flex-1 w-full overflow-x-hidden">
+        {systemNotice && (
+          <div
+            data-testid="global-system-notice"
+            className="mx-4 mt-3 flex items-center justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-950/40 px-4 py-2 text-xs font-mono text-rose-200"
+          >
+            <span>{systemNotice}</span>
+            <button
+              type="button"
+              onClick={() => setSystemNotice(null)}
+              className="text-rose-100 hover:text-white underline shrink-0"
+            >
+              Zavřít
+            </button>
+          </div>
+        )}
         {activeTab === 'chat' && (
           <ChatOS
             onOpenTrace={handleOpenTrace}
@@ -219,6 +287,9 @@ export default function App() {
             activities={activities}
             onAssetsUpdated={refreshAssets}
             onOpenVaultAsset={handleOpenVaultAsset}
+            onOpenNotebookLM={() => setIsNotebookLMOpen(true)}
+            pendingPrompt={pendingChatPrompt}
+            onClearPendingPrompt={() => setPendingChatPrompt(null)}
           />
         )}
         {activeTab === 'agents' && (
@@ -254,6 +325,14 @@ export default function App() {
             currentActor={currentActor}
           />
         )}
+        {activeTab === 'comments' && (
+          <CommentSwarmView
+            assets={assets}
+            currentActor={currentActor}
+            onOpportunitiesUpdated={refreshOpportunities}
+            onActivitiesUpdated={refreshActivities}
+          />
+        )}
         {activeTab === 'analytics' && (
           <AnalyticsView
             onSelectTrendForVideo={handleSelectTrendForVideo}
@@ -274,8 +353,11 @@ export default function App() {
         isOpen={isPublishOpen}
         onClose={() => setIsPublishOpen(false)}
         initialVideoTitle={publishVideoTitle}
+        initialAssetId={publishAssetId}
         initialFormat={publishFormat}
         initialCategory={publishCategory}
+        initialDescription={publishDescription}
+        initialTags={publishTags}
         currentActor={currentActor}
       />
 
@@ -294,6 +376,12 @@ export default function App() {
       <DocsModal
         isOpen={isDocsOpen}
         onClose={() => setIsDocsOpen(false)}
+      />
+
+      <NotebookLMStudioModal
+        isOpen={isNotebookLMOpen}
+        onClose={() => setIsNotebookLMOpen(false)}
+        onGenerate={handleGenerateFromNotebookLM}
       />
     </div>
   );

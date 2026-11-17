@@ -66,7 +66,7 @@ export class EvalsRunner {
         const goalFulfilled = reply.length > 25;
         const concreteLanguage = !/synergický zázrak/i.test(reply) && reply.split(' ').length >= 10;
         const noFictitiousMoney = !/garantujeme zisk/i.test(reply) && !/peníze vám již leží/i.test(reply);
-        const czechLanguage = /[ěščřžýáíéůú]/i.test(reply) || /[a-z]/i.test(reply);
+        const czechLanguage = /[ěščřžýáíéůúťďň]/i.test(reply);
         const has6Suggestions = suggestions.length === 6;
         const toolsInvoked = (trace.toolCalls && trace.toolCalls.length > 0) || false;
 

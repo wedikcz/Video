@@ -33,6 +33,8 @@ interface PublishModalProps {
   initialAssetId?: string;
   initialFormat?: '9:16' | '16:9';
   initialCategory?: VideoTemplateCategory;
+  initialDescription?: string;
+  initialTags?: string;
   currentActor?: TeamMember;
 }
 
@@ -43,6 +45,8 @@ export const PublishModal: React.FC<PublishModalProps> = ({
   initialAssetId = 'asset-001',
   initialFormat = '9:16',
   initialCategory = 'viral_hook',
+  initialDescription,
+  initialTags,
   currentActor,
 }) => {
   const [integrations, setIntegrations] = useState<SocialIntegration[]>([]);
@@ -55,9 +59,12 @@ export const PublishModal: React.FC<PublishModalProps> = ({
   const [scheduledDateTime, setScheduledDateTime] = useState('');
   const [videoTitle, setVideoTitle] = useState(initialVideoTitle);
   const [description, setDescription] = useState(
-    'Automaticky vygenerováno v NEXUS X OS Video Studio. Kompletní postup a šablona v popisku!'
+    initialDescription ||
+      'Automaticky vygenerováno v NEXUS X OS Video Studio. Kompletní postup a šablona v popisku!'
   );
-  const [tags, setTags] = useState('Shorts, TikTok, Reels, AI, Automatizace, MoviePy');
+  const [tags, setTags] = useState(
+    initialTags || 'Shorts, TikTok, Reels, AI, Automatizace, MoviePy'
+  );
   const [privacy, setPrivacy] = useState<'public' | 'unlisted' | 'private'>('public');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState<'publish' | 'channels' | 'history'>('publish');
@@ -72,12 +79,14 @@ export const PublishModal: React.FC<PublishModalProps> = ({
       loadData();
       setErrorMessage(null);
       if (initialVideoTitle) setVideoTitle(initialVideoTitle);
+      if (initialDescription) setDescription(initialDescription);
+      if (initialTags) setTags(initialTags);
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
       tomorrow.setHours(18, 0, 0, 0);
       setScheduledDateTime(tomorrow.toISOString().slice(0, 16));
     }
-  }, [isOpen, initialVideoTitle]);
+  }, [isOpen, initialVideoTitle, initialDescription, initialTags]);
 
   const loadData = async () => {
     try {
@@ -198,6 +207,7 @@ export const PublishModal: React.FC<PublishModalProps> = ({
           <button
             type="button"
             aria-label="Zavřít publikační okno"
+            data-testid="close-publish-modal"
             onClick={onClose}
             className="rounded p-1.5 text-zinc-400 hover:bg-zinc-900 hover:text-white"
           >
@@ -374,10 +384,10 @@ export const PublishModal: React.FC<PublishModalProps> = ({
               <label className="block">
                 <span className="text-[11px] text-zinc-500">Popisek s CTA a hashtagy:</span>
                 <textarea
-                  rows={3}
+                  rows={4}
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  className="mt-1 w-full rounded border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 resize-none"
+                  className="mt-1 w-full rounded border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 resize-y"
                 />
               </label>
 

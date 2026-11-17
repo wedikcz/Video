@@ -29,6 +29,34 @@ export class AgentOrchestrator {
     const tracer = new TracerService(runId, params.threadId, params.userMessage);
     const overallEnd = tracer.startSpan('orchestrator:lifecycle');
 
+    // 0. Enforce Emergency Kill Switch honestly at runtime boundary
+    if (db.isSystemPaused) {
+      overallEnd('error', { reason: 'Emergency Kill Switch active' });
+      const trace = tracer.finish();
+      const pausedMsg: Message = {
+        id: `msg-${Date.now()}`,
+        threadId: params.threadId,
+        role: 'assistant',
+        content:
+          'NEXUS X OS je aktuálně pozastaven (Nouzový Kill Switch). Autonomní nástroje a video rendery byly z bezpečnostních důvodů zastaveny. Klikněte na "OBNOVIT OS" v horní liště pro pokračování.',
+        createdAt: new Date().toISOString(),
+        suggestions: [
+          'Obnovit provoz NEXUS X OS v horní liště',
+          'Zkontrolovat auditní aktivitu před pozastavením',
+          'Ověřit zůstatek denního rozpočtu',
+          'Zobrazit stav 16 agentů',
+          'Otevřít Media Vault s hotovými videi',
+          'Zkontrolovat nastavení oprávnění týmu (RBAC)',
+        ],
+        confidence: 0,
+        runId,
+      };
+      const messages = db.messages.get(params.threadId) || [];
+      messages.push(pausedMsg);
+      db.messages.set(params.threadId, messages);
+      return { message: pausedMsg, runId, trace };
+    }
+
     // 1. Guardrail validation
     const guardrailCheck = GuardrailsService.validateInput(params.userMessage);
     if (!guardrailCheck.allowed) {
@@ -85,9 +113,16 @@ export class AgentOrchestrator {
     const isExplicitBoardroomGoal =
       !VideoDirectorEngine.isVideoRequest(inputLower) &&
       (inputLower.includes('boardroom') || inputLower.includes('porada') || inputLower.includes('konsenzus'));
+    const isExplicitCommentGoal =
+      !VideoDirectorEngine.isVideoRequest(inputLower) &&
+      (inputLower.includes('komentář') ||
+        inputLower.includes('komentování') ||
+        inputLower.includes('koment') ||
+        inputLower.includes('troll') ||
+        inputLower.includes('komunit'));
 
     const isSwitchedAwayFromVideo =
-      isExplicitMoneyGoal || isExplicitAffiliateGoal || isExplicitBoardroomGoal;
+      isExplicitMoneyGoal || isExplicitAffiliateGoal || isExplicitBoardroomGoal || isExplicitCommentGoal;
     if (isSwitchedAwayFromVideo && priorDraft) {
       db.videoBriefDrafts.delete(params.threadId);
     }
@@ -104,9 +139,23 @@ export class AgentOrchestrator {
       directorAnalysis?.isVideoIntent && directorAnalysis?.needsClarification && directorAnalysis?.clarification
     );
 
+    if (params.onStreamEvent && isVideoGoal && !needsClarification && directorAnalysis) {
+      params.onStreamEvent({
+        type: 'span',
+        data: {
+          stage: 'thinking',
+          message:
+            directorAnalysis.batchCount > 1
+              ? `NEO Deep Thinking: Navržena ${directorAnalysis.batchCount}dílná série (${directorAnalysis.reasoningTrace?.thinkingTitle || 'Retention 2026'})...`
+              : `NEO Video Director: Režie "${directorAnalysis.brief.title}" (${directorAnalysis.brief.notebookStyle || directorAnalysis.brief.visualStyle})...`,
+        },
+      });
+    }
+
     const isMoneyGoal = !isVideoGoal && isExplicitMoneyGoal;
     const isAffiliateGoal = !isVideoGoal && isExplicitAffiliateGoal;
     const isBoardroomGoal = !isVideoGoal && isExplicitBoardroomGoal;
+    const isCommentGoal = !isVideoGoal && isExplicitCommentGoal;
 
     const toolsToCall: Array<{ name: string; args: any; idempotencyKey?: string }> = [];
 
@@ -130,6 +179,15 @@ export class AgentOrchestrator {
         },
         idempotencyKey: `asset-gen-${runId}-1`,
       });
+    } else if (isCommentGoal) {
+      toolsToCall.push({ name: 'analyze_social_comments', args: { platform: 'all' } });
+      if (inputLower.includes('autopilot') || inputLower.includes('spusť') || inputLower.includes('odpověz')) {
+        toolsToCall.push({
+          name: 'autopilot_comment_swarm',
+          args: { strategy: 'hormozi_hook', syncLeads: true },
+          idempotencyKey: `swarm-${runId}`,
+        });
+      }
     } else if (isMoneyGoal) {
       toolsToCall.push({
         name: 'compute_scenario',
@@ -262,36 +320,66 @@ export class AgentOrchestrator {
 
     // Batch variants when batchCount > 1
     if (isVideoGoal && !needsClarification && directorAnalysis && videoBatchCount > 1) {
-      const variantAngles = [
-        'Rychlý 3s Hook + Překvapení',
-        'Praktická ukázka krok za krokem',
-        'Srovnání před a po automatizaci',
-        'Častá chyba tvůrců & řešení',
-        'Zákulisní výsledek s CTA na šablonu',
-      ];
       for (let i = 2; i <= videoBatchCount; i++) {
-        const angle = variantAngles[(i - 1) % variantAngles.length];
-        const variantBrief: VideoCreativeBrief = {
-          ...directorAnalysis.brief,
-          title: `${directorAnalysis.brief.topic.slice(0, 46)} (#${i}: ${angle})`,
-          hook: `${angle} — ${directorAnalysis.brief.topic}`,
+        const variantBrief: VideoCreativeBrief =
+          directorAnalysis.batchBriefs && directorAnalysis.batchBriefs[i - 1]
+            ? directorAnalysis.batchBriefs[i - 1]
+            : {
+                ...directorAnalysis.brief,
+                title: `${directorAnalysis.brief.topic.slice(0, 46)} (#${i})`,
+                hook: `Díl #${i} — ${directorAnalysis.brief.topic}`,
+              };
+        const toolArgs = {
+          topic: variantBrief.title,
+          threadId: params.threadId,
+          format: variantBrief.aspectRatio,
+          durationSec: variantBrief.durationSec,
+          brief: variantBrief,
         };
+        const idempotencyKey = `asset-gen-${runId}-${i}`;
+
+        if (params.onStreamEvent) {
+          params.onStreamEvent({
+            type: 'tool_event',
+            data: { status: 'running', tool: 'render_video_mp4', args: toolArgs, episode: i, total: videoBatchCount },
+          });
+        }
+
+        const batchSpan = tracer.startSpan(`tool:render_video_mp4:ep${i}`);
         const batchResult = await ToolExecutor.executeTool(
           'render_video_mp4',
+          toolArgs,
           {
-            topic: variantBrief.title,
-            threadId: params.threadId,
-            format: variantBrief.aspectRatio,
-            durationSec: variantBrief.durationSec,
-            brief: variantBrief,
-          },
-          {
-            idempotencyKey: `asset-gen-${runId}-${i}`,
+            idempotencyKey,
             dryRun: params.dryRun,
           }
         );
+
         if (batchResult.success && batchResult.result?.asset) {
           generatedAssets.push(batchResult.result.asset);
+        }
+
+        tracer.recordToolCall(
+          'render_video_mp4',
+          toolArgs,
+          batchResult.result || batchResult.error,
+          batchResult.durationMs,
+          idempotencyKey
+        );
+        batchSpan(batchResult.success ? 'ok' : 'error', { durationMs: batchResult.durationMs });
+
+        toolEvents.push({
+          tool: 'render_video_mp4',
+          input: toolArgs,
+          output: batchResult.result || { error: batchResult.error },
+          timestamp: new Date().toISOString(),
+        });
+
+        if (params.onStreamEvent) {
+          params.onStreamEvent({
+            type: 'tool_event',
+            data: { status: 'completed', tool: 'render_video_mp4', output: batchResult.result, episode: i, total: videoBatchCount },
+          });
         }
       }
     }
@@ -316,12 +404,21 @@ export class AgentOrchestrator {
       ].slice(0, 6);
     } else if (isVideoGoal && directorAnalysis) {
       const b = directorAnalysis.brief;
-      const countText =
-        generatedAssets.length > 1
-          ? `Vyrenderoval jsem ${generatedAssets.length} unikátních MP4 videí`
-          : `Vyrenderoval jsem na míru režírované MP4 video "${b.title}"`;
-
-      replyText = `${countText}${params.dryRun ? ' (režim DRY-RUN s ověřeným referenčním MP4)' : ''} pro ${b.platform} (${b.aspectRatio}, ${b.durationSec}s, styl ${b.visualStyle}, ${b.bpm} BPM) pomocí ${b.engineUsed}. Video má ${b.scenes.length} dynamické scény šité přesně podle zadání a je připraveno ke streamu i stažení.`;
+      if (generatedAssets.length === 0) {
+        const renderErr =
+          toolEvents.find((t) => t.tool === 'render_video_mp4' && t.output?.error)?.output?.error ||
+          'Renderovací worker nevrátil platný MP4 asset.';
+        replyText = `Render videa "${b.title}" (${b.platform}, ${b.aspectRatio}) nebyl dokončen: ${renderErr}. Zkontrolujte prosím stav workeru nebo nouzový Kill Switch a zkuste úlohu spustit znovu.`;
+      } else if (generatedAssets.length > 1 && directorAnalysis.videoBatchSuite) {
+        const suite = directorAnalysis.videoBatchSuite;
+        replyText = `Vyrenderoval jsem kompletní sérii ${generatedAssets.length} unikátních MP4 videí "${suite.suiteTitle}" (${suite.platform}, celkem ${suite.totalDurationSec}s, engine ${b.engineUsed})${params.dryRun ? ' [DRY-RUN]' : ''}. Každý díl má vlastní vizuální paletu, animovaný 4-bodový gradient, kinetické Hormozi titulky a syntetizovaný beat v Media Vaultu.`;
+      } else {
+        const countText =
+          generatedAssets.length > 1
+            ? `Vyrenderoval jsem ${generatedAssets.length} unikátních MP4 videí`
+            : `Vyrenderoval jsem na míru režírované MP4 video "${b.title}"`;
+        replyText = `${countText}${params.dryRun ? ' (režim DRY-RUN)' : ''} pro ${b.platform} (${b.aspectRatio}, ${b.durationSec}s, styl ${b.notebookStyle || b.visualStyle}, ${b.bpm} BPM) pomocí ${b.engineUsed}. Video má ${b.scenes.length} dynamické scény šité přesně podle zadání a je připraveno ke streamu i stažení.`;
+      }
 
       suggestions = [
         `Přepracuj téma "${b.topic.slice(0, 28)}" do 16:9 pro YouTube`,
@@ -353,6 +450,18 @@ export class AgentOrchestrator {
         'Spustit zátěžový test kapacity COO',
         'Přezkoumat finanční limity s CFO',
       ];
+    } else if (isCommentGoal) {
+      const kpis = db.getCommentSwarmKpis();
+      replyText = `Aktivoval jsem 5jádrový AI Comment Swarm. V inboxu mám ${kpis.totalComments} komentářů napříč YouTube, TikTok a Instagram Reels (${kpis.pendingCount} čeká na reakci, ${kpis.hotLeadsCount} hot leadů v odhadované hodnotě ${kpis.unlockedCrmValueCzk.toLocaleString()} Kč, ${kpis.blockedSpamCount} hrozeb v Troll-Shield karanténě).`;
+
+      suggestions = [
+        'Spusť Swarm Autopilot pro všechny čekající komentáře',
+        'Otevři záložku AI Komentáře a zkontroluj 5jádrovou matici',
+        'Synchronizuj hot leady z komentářů do Monetizace',
+        'Vygeneruj připnutý DM komentář k nejnovějšímu videu',
+        'Vytvoř 5 videí na TikTok',
+        'Zobraz stav všech 16 agentů',
+      ];
     } else {
       replyText = `Analyzoval jsem váš požadavek v operačním systému NEXUS X OS. Do exekuce jsem zapojil 16 agentů a zkontroloval pipeline příležitostí ve výši 68 600 Kč. Zvolte další krok a systém autonomně vygeneruje video MP4, affiliate strukturu nebo přepočítá finanční model.`;
 
@@ -360,8 +469,8 @@ export class AgentOrchestrator {
         'Vytvoř 9s kyberpunk TikTok video o AI automatizaci faktur',
         'Vytvoř mi video',
         'Vytvoř 5 videí na TikTok',
+        'Spusť AI komentování a analyzuj hot leady',
         'Chci vydělat 50 000 Kč měsíčně',
-        'Najdi affiliate příležitosti',
         'Spusť AI boardroom',
       ];
     }
@@ -462,6 +571,8 @@ export class AgentOrchestrator {
       ...(needsClarification && directorAnalysis?.clarification
         ? { clarificationRequest: directorAnalysis.clarification }
         : {}),
+      ...(directorAnalysis?.reasoningTrace ? { reasoningTrace: directorAnalysis.reasoningTrace } : {}),
+      ...(directorAnalysis?.videoBatchSuite ? { videoBatchSuite: directorAnalysis.videoBatchSuite } : {}),
     };
 
     const messages = db.messages.get(params.threadId) || [];

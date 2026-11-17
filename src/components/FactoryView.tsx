@@ -33,19 +33,14 @@ import {
   ShieldCheck,
   Zap,
   Clock,
-  Wand2,
   Coins,
-  Camera,
-  Globe,
-  SlidersHorizontal,
-  CreditCard,
   LayoutGrid,
   List,
+  Eye,
 } from 'lucide-react';
 import {
   FactoryAsset,
   VideoStoryboard,
-  VideoScene,
   UserVideoTemplate,
   VideoTemplateCategory,
   TeamMember,
@@ -54,19 +49,53 @@ import {
   OpenGenModelSpec,
   OpenGenCreditsState,
   OpenGenCameraMotion,
+  StructuredVideoPrompt,
+  TemporalSceneBeat,
+  BatchVideoQueueItem,
 } from '../types/nexus.ts';
 import { downloadVideoAsset } from '../utils/mediaDownload.ts';
 import {
   smartVideoOrchestrator,
   SmartVideoProgressUpdate,
 } from '../services/SmartVideoOrchestrator.ts';
+import { copyTextSafely } from '../utils/clipboard.ts';
+import { StructuredPromptBuilder } from './StructuredPromptBuilder.tsx';
+import { MonetizationCheatsheetsPanel } from './MonetizationCheatsheetsPanel.tsx';
+import { AssetReviewModal } from './AssetReviewModal.tsx';
+import { BatchQueuePanel } from './BatchQueuePanel.tsx';
+import {
+  CAMERA_MOTION_LABELS,
+  LIGHTING_LABELS,
+  OPTICS_LABELS,
+  PHASE_LABELS,
+  VISUAL_STYLE_PALETTES,
+  enhanceStructuredPromptLocally,
+  parseStructuredPromptFromText,
+} from '../utils/structuredVideoPrompt.ts';
+import { resolveSelectedStyleTag } from '../utils/aiSmartEnhance.ts';
+import {
+  CreateBatchQueueItemInput,
+  addBatchQueueItem,
+  clearFinishedBatchItems,
+  createBatchQueueItem,
+  getNextPendingBatchItem,
+  moveBatchQueueItem,
+  removeBatchQueueItem,
+  retryBatchQueueItem,
+  updateBatchQueueItem,
+} from '../utils/batchVideoQueue.ts';
 
 interface FactoryViewProps {
   assets: FactoryAsset[];
   onRefreshAssets: () => void;
   initialTopic?: string;
   initialTemplateId?: string;
-  onOpenPublish?: (videoTitle?: string, format?: '9:16' | '16:9', category?: VideoTemplateCategory) => void;
+  onOpenPublish?: (
+    videoTitle?: string,
+    format?: '9:16' | '16:9',
+    category?: VideoTemplateCategory,
+    extra?: { assetId?: string; description?: string; tags?: string[] }
+  ) => void;
   currentActor?: TeamMember;
 }
 
@@ -141,10 +170,10 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
   const [previewMode, setPreviewMode] = useState<'mp4' | 'canvas'>('canvas');
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // OpenGen.ai/cs Suite State
+  // OpenGen.ai/cs & Local Zero-API Structured Text-to-Video State
   const [studioMode, setStudioMode] = useState<'opengen' | 'moviepy'>('opengen');
   const [openGenModels, setOpenGenModels] = useState<OpenGenModelSpec[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState<string>('veo-3-1');
+  const [selectedModelId, setSelectedModelId] = useState<string>('nexus-local-director');
   const [openGenMode, setOpenGenMode] = useState<'text_to_video' | 'image_to_video' | 'video_to_video'>('text_to_video');
   const [cameraMotion, setCameraMotion] = useState<OpenGenCameraMotion>('orbit_360');
   const [motionIntensity, setMotionIntensity] = useState<number>(7);
@@ -152,7 +181,21 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
   const [qualityTier, setQualityTier] = useState<'720p' | '1080p' | '4K'>('1080p');
   const [promptMagic, setPromptMagic] = useState<boolean>(true);
   const [negativePrompt, setNegativePrompt] = useState<string>('artefakty, rozmazání, deformace, nízká kvalita, vodoznak');
-  const [showNegativePrompt, setShowNegativePrompt] = useState<boolean>(false);
+  const [structuredPrompt, setStructuredPrompt] = useState<StructuredVideoPrompt>(() =>
+    parseStructuredPromptFromText(
+      initialTopic || '5 AI automatizací, které vám ušetří 4 hodiny denně a jak je monetizovat',
+      {
+        aspectRatio: '9:16',
+        cameraMotion: 'orbit_360',
+        motionIntensity: 7,
+        fps: 30,
+        negativePrompt: 'artefakty, rozmazání, deformace, nízká kvalita, vodoznak',
+      }
+    )
+  );
+  const [isStructuringPrompt, setIsStructuringPrompt] = useState(false);
+  const [isAiEnhancing, setIsAiEnhancing] = useState(false);
+  const [aiEnhanceNotes, setAiEnhanceNotes] = useState<string[] | null>(null);
   const [creditsState, setCreditsState] = useState<OpenGenCreditsState>({
     available: 350,
     monthlyQuota: 500,
@@ -162,17 +205,44 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     expiresAt: new Date(Date.now() + 86400000 * 24).toISOString(),
   });
   const [isTopUpModalOpen, setIsTopUpModalOpen] = useState(false);
-  const [isEnhancingPrompt, setIsEnhancingPrompt] = useState(false);
   const [galleryLayout, setGalleryLayout] = useState<'grid' | 'row'>('grid');
   const [gallerySize, setGallerySize] = useState<'mini' | 'small' | 'medium' | 'large'>('medium');
+  const [reviewModalAsset, setReviewModalAsset] = useState<FactoryAsset | null>(null);
+
+  // Sequential Batch Processing Queue State
+  const [batchQueue, setBatchQueue] = useState<BatchVideoQueueItem[]>([]);
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const batchQueueRef = useRef<BatchVideoQueueItem[]>([]);
+  const isBatchRunningRef = useRef<boolean>(false);
+  const batchAbortRef = useRef<AbortController | null>(null);
+  const creditsAvailableRef = useRef<number>(350);
+
+  useEffect(() => {
+    creditsAvailableRef.current = creditsState.available;
+  }, [creditsState.available]);
+
+  const updateBatchQueueState = (
+    updater: (prev: BatchVideoQueueItem[]) => BatchVideoQueueItem[]
+  ) => {
+    const next = updater(batchQueueRef.current);
+    batchQueueRef.current = next;
+    setBatchQueue(next);
+  };
 
   // Video Player state
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0); // 0 - 42 seconds
+  const [currentTime, setCurrentTime] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const currentTimeRef = useRef<number>(0);
+  const isPlayingRef = useRef<boolean>(false);
+
+  const seekPreviewTime = (nextSec: number) => {
+    currentTimeRef.current = nextSec;
+    setCurrentTime(nextSec);
+  };
 
   const canCreateVideos = !currentActor || currentActor.permissions.includes('create_edit_videos');
   const canManageTemplates = !currentActor || currentActor.permissions.includes('manage_templates');
@@ -181,6 +251,15 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
   useEffect(() => {
     if (initialTopic) {
       setTopic(initialTopic);
+      setStructuredPrompt(
+        parseStructuredPromptFromText(initialTopic, {
+          aspectRatio: format,
+          cameraMotion,
+          motionIntensity,
+          fps: fps === 24 || fps === 60 ? fps : 30,
+          negativePrompt,
+        })
+      );
     }
   }, [initialTopic]);
 
@@ -232,6 +311,8 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     fetchOpenGenData();
     return () => {
       abortControllerRef.current?.abort();
+      isBatchRunningRef.current = false;
+      batchAbortRef.current?.abort();
     };
   }, []);
 
@@ -257,6 +338,15 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
       setCurrentStoryboard(videoAsset.videoStoryboard);
       setCurrentMoviePyScript(videoAsset.moviePyScript || '');
       setCurrentVideoAsset(videoAsset);
+      const assetStructured =
+        videoAsset.structuredPrompt ||
+        videoAsset.videoBrief?.structuredPrompt ||
+        videoAsset.videoStoryboard.structuredPrompt;
+      if (assetStructured) {
+        setStructuredPrompt(assetStructured);
+        setCameraMotion(assetStructured.camera.primaryMotion);
+        setMotionIntensity(assetStructured.camera.motionIntensity);
+      }
       if (videoAsset.status === 'ready' && videoAsset.streamUrl) {
         setPreviewMode('mp4');
       }
@@ -438,6 +528,11 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           topic,
           format,
           templateId: selectedTemplateId,
+          structuredPrompt: {
+            ...structuredPrompt,
+            aspectRatio: format,
+            rawPrompt: topic,
+          },
         },
         {
           signal: controller.signal,
@@ -446,6 +541,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
             if (initial.storyboard) setCurrentStoryboard(initial.storyboard);
             if (initial.moviePyScript) setCurrentMoviePyScript(initial.moviePyScript);
             if (initial.asset) setCurrentVideoAsset(initial.asset);
+            if (initial.structuredPrompt) setStructuredPrompt(initial.structuredPrompt);
           },
           onProgress: (update) => {
             setRenderProgress(update);
@@ -459,6 +555,9 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
       if (result.moviePyScript) {
         setCurrentMoviePyScript(result.moviePyScript);
       }
+      if (result.structuredPrompt) {
+        setStructuredPrompt(result.structuredPrompt);
+      }
       if (result.asset) {
         setCurrentVideoAsset(result.asset);
         if (result.asset.line === 'video' && result.asset.status === 'ready' && result.asset.streamUrl) {
@@ -466,7 +565,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
         }
       }
       onRefreshAssets();
-      setCurrentTime(0);
+      seekPreviewTime(0);
       setIsPlaying(true);
     } catch (err: any) {
       if (err?.name === 'AbortError') return;
@@ -529,7 +628,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
         }
       }
       onRefreshAssets();
-      setCurrentTime(0);
+      seekPreviewTime(0);
       setIsPlaying(true);
     } catch (err: any) {
       if (err?.name === 'AbortError') return;
@@ -539,23 +638,386 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     }
   };
 
-  const handlePromptEnhance = async () => {
-    if (!topic.trim() || isEnhancingPrompt) return;
-    setIsEnhancingPrompt(true);
+  const handleStructuredPromptChange = (next: StructuredVideoPrompt) => {
+    setStructuredPrompt(next);
+    setCameraMotion(next.camera.primaryMotion);
+    setMotionIntensity(next.camera.motionIntensity);
+    setFps(next.fps);
+    setFormat(next.aspectRatio);
+    setNegativePrompt(next.style.negativePrompt);
+  };
+
+  const handleApplyMonetizedPrompt = (nextPrompt: StructuredVideoPrompt, notice: string) => {
+    setTopic(nextPrompt.rawPrompt);
+    handleStructuredPromptChange(nextPrompt);
+    setTemplateSuccessMsg(notice);
+    setTimeout(() => setTemplateSuccessMsg(null), 3500);
+  };
+
+  const handleLoadAssetIntoEditor = (asset: FactoryAsset) => {
+    setCurrentVideoAsset(asset);
+    if (asset.videoStoryboard) {
+      setCurrentStoryboard(asset.videoStoryboard);
+    }
+    if (asset.moviePyScript) {
+      setCurrentMoviePyScript(asset.moviePyScript);
+    }
+    const sp =
+      asset.structuredPrompt ||
+      asset.videoBrief?.structuredPrompt ||
+      asset.videoStoryboard?.structuredPrompt;
+    if (sp) {
+      setTopic(sp.rawPrompt);
+      handleStructuredPromptChange(sp);
+    } else if (asset.title) {
+      setTopic(asset.title);
+    }
+    if (asset.status === 'ready' && asset.streamUrl) {
+      setPreviewMode('mp4');
+    }
+    setTemplateSuccessMsg(`Asset "${asset.title}" byl načten do editoru promptu.`);
+    setTimeout(() => setTemplateSuccessMsg(null), 3000);
+  };
+
+  const handlePublishReviewedAsset = (asset: FactoryAsset) => {
+    if (!onOpenPublish) return;
+    const sp =
+      asset.structuredPrompt ||
+      asset.videoBrief?.structuredPrompt ||
+      asset.videoStoryboard?.structuredPrompt;
+    const resolvedFormat: '9:16' | '16:9' =
+      asset.videoStoryboard?.aspectRatio ||
+      sp?.aspectRatio ||
+      (asset.resolution === '1280x720' ? '16:9' : format);
+    const kit = sp?.monetizationKit || structuredPrompt.monetizationKit;
+    const description = kit
+      ? `${kit.hookLine}\n\n${asset.body}\n\n${kit.ctaLine}`
+      : asset.body;
+    const tags = kit?.brandSafeTags || asset.tags;
+    onOpenPublish(
+      kit?.seoTitle || asset.videoStoryboard?.title || asset.title,
+      resolvedFormat,
+      activeTemplate?.category || 'viral_hook',
+      {
+        assetId: asset.id,
+        description,
+        tags,
+      }
+    );
+  };
+
+  const handleSmartParsePrompt = async () => {
+    if (!topic.trim() || isStructuringPrompt) return;
+    setIsStructuringPrompt(true);
+    setErrorMsg(null);
+    const validFps: 24 | 30 | 60 = fps === 24 || fps === 60 ? fps : 30;
     try {
-      const res = await smartVideoOrchestrator.enhancePrompt(topic, {
-        modelId: selectedModelId,
-        camera: cameraMotion,
+      const res = await smartVideoOrchestrator.parseStructuredPrompt({
+        rawPrompt: topic,
+        aspectRatio: format,
+        fps: validFps,
+        negativePrompt,
       });
-      if (res.enhancedPrompt) {
-        setTopic(res.enhancedPrompt);
-        setTemplateSuccessMsg('Prompt Magic: Prompt byl kinematograficky obohacen podle standardů OpenGen!');
+      if (res.structuredPrompt) {
+        handleStructuredPromptChange(res.structuredPrompt);
+        setTemplateSuccessMsg(
+          `Lokální NLP rozložilo zadání na ${res.structuredPrompt.temporal.beats.length} časové fáze (připravenost ${res.score.overall}/100).`
+        );
         setTimeout(() => setTemplateSuccessMsg(null), 3500);
       }
     } catch {
-      setErrorMsg('Rozšíření promptu selhalo.');
+      const localParsed = parseStructuredPromptFromText(topic, {
+        aspectRatio: format,
+        fps: validFps,
+        negativePrompt,
+      });
+      handleStructuredPromptChange(localParsed);
     } finally {
-      setIsEnhancingPrompt(false);
+      setIsStructuringPrompt(false);
+    }
+  };
+
+  const handleSmartEnhancePrompt = async () => {
+    if (!topic.trim() || isStructuringPrompt) return;
+    setIsStructuringPrompt(true);
+    setErrorMsg(null);
+    try {
+      const res = await smartVideoOrchestrator.enhanceStructuredPrompt({
+        structuredPrompt: {
+          ...structuredPrompt,
+          rawPrompt: topic,
+          aspectRatio: format,
+          fps: fps === 24 || fps === 60 ? fps : 30,
+        },
+        rawPrompt: topic,
+        cameraMotion,
+        motionIntensity,
+      });
+      if (res.structuredPrompt) {
+        handleStructuredPromptChange(res.structuredPrompt);
+        setTemplateSuccessMsg(
+          `Lokální režisér obohatil 4-pilířovou strukturu (${res.score.overall}/100) bez externího API.`
+        );
+        setTimeout(() => setTemplateSuccessMsg(null), 3500);
+      }
+    } catch {
+      const localEnhanced = enhanceStructuredPromptLocally(structuredPrompt, {
+        cameraMotion,
+        motionIntensity,
+      });
+      handleStructuredPromptChange(localEnhanced.structuredPrompt);
+    } finally {
+      setIsStructuringPrompt(false);
+    }
+  };
+
+  const handleAiSmartEnhancePrompt = async () => {
+    if (!topic.trim() || isAiEnhancing || isStructuringPrompt) return;
+    setIsAiEnhancing(true);
+    setErrorMsg(null);
+
+    const activeStyle = resolveSelectedStyleTag(structuredPrompt);
+    try {
+      const res = await smartVideoOrchestrator.aiSmartEnhancePrompt({
+        structuredPrompt: {
+          ...structuredPrompt,
+          rawPrompt: topic,
+          aspectRatio: format,
+          fps: fps === 24 || fps === 60 ? fps : 30,
+        },
+        rawPrompt: topic,
+        selectedStyleTagId: activeStyle.tagId,
+      });
+
+      if (res.structuredPrompt) {
+        setTopic(res.expandedRawPrompt || res.structuredPrompt.rawPrompt);
+        handleStructuredPromptChange(res.structuredPrompt);
+        setAiEnhanceNotes(res.cinematicNotes || null);
+        setTemplateSuccessMsg(
+          `AI Smart Enhance (${res.model}) rozšířil scénu podle stylu „${res.selectedStyleTagLabel}“ (${res.score.overall}/100).`
+        );
+        setTimeout(() => setTemplateSuccessMsg(null), 4500);
+      }
+    } catch (err: any) {
+      setErrorMsg(
+        err?.message ||
+          'AI Smart Enhance selhal. Pro okamžité offline obohacení můžete použít tlačítko „Chytře vylepšit (Lokálně)“.'
+      );
+    } finally {
+      setIsAiEnhancing(false);
+    }
+  };
+
+  const handleAddCurrentToBatchQueue = () => {
+    if (!topic.trim()) {
+      setErrorMsg('Nejprve zadejte popis nebo prompt scény před zařazením do dávky.');
+      return;
+    }
+    setErrorMsg(null);
+    const activeModel = openGenModels.find((m) => m.id === selectedModelId);
+    const modelName = activeModel?.name || 'Lokální Chytrý Režisér (Bez API)';
+    const creditCost = activeModel ? activeModel.creditCost : 0;
+
+    const item = createBatchQueueItem({
+      prompt: topic,
+      modelId: selectedModelId,
+      modelName,
+      creditCost,
+      mode: openGenMode,
+      format,
+      durationSec: Math.min(
+        activeModel?.maxDurationSec || 15,
+        structuredPrompt.totalDurationSec || 6
+      ),
+      fps: fps === 24 || fps === 60 ? fps : 30,
+      qualityTier,
+      cameraMotion,
+      motionIntensity,
+      visualStyle: structuredPrompt.style.visualStyle,
+      negativePrompt,
+      promptMagic,
+      templateId: selectedTemplateId,
+      structuredPrompt: {
+        ...structuredPrompt,
+        rawPrompt: topic,
+        aspectRatio: format,
+        fps: fps === 24 || fps === 60 ? fps : 30,
+      },
+    });
+
+    updateBatchQueueState((prev) => addBatchQueueItem(prev, item));
+    setTemplateSuccessMsg(`Úloha „${item.title}“ přidána do sekvenční dávkové fronty.`);
+    setTimeout(() => setTemplateSuccessMsg(null), 3000);
+  };
+
+  const handleAddCustomBatchTask = (input: CreateBatchQueueItemInput) => {
+    setErrorMsg(null);
+    const item = createBatchQueueItem(input);
+    updateBatchQueueState((prev) => addBatchQueueItem(prev, item));
+    setTemplateSuccessMsg(`Vlastní úloha „${item.title}“ zařazena do fronty.`);
+    setTimeout(() => setTemplateSuccessMsg(null), 3000);
+  };
+
+  const handlePauseBatchQueue = () => {
+    isBatchRunningRef.current = false;
+    setIsBatchRunning(false);
+    batchAbortRef.current?.abort();
+    updateBatchQueueState((prev) =>
+      prev.map((item) =>
+        item.status === 'running'
+          ? {
+              ...item,
+              status: 'cancelled',
+              workerMessage: 'Pozastaveno uživatelem.',
+            }
+          : item
+      )
+    );
+  };
+
+  const handleStartBatchQueue = async () => {
+    if (isBatchRunningRef.current || !canCreateVideos) return;
+    if (!getNextPendingBatchItem(batchQueueRef.current)) return;
+
+    isBatchRunningRef.current = true;
+    setIsBatchRunning(true);
+    setErrorMsg(null);
+
+    try {
+      while (isBatchRunningRef.current) {
+        const nextItem = getNextPendingBatchItem(batchQueueRef.current);
+        if (!nextItem) break;
+
+        if (nextItem.creditCost > 0 && creditsAvailableRef.current < nextItem.creditCost) {
+          updateBatchQueueState((prev) =>
+            updateBatchQueueItem(prev, nextItem.id, {
+              status: 'failed',
+              progressPercent: 0,
+              error: `Nedostatek kreditů (vyžaduje ${nextItem.creditCost}, dostupných ${creditsAvailableRef.current}).`,
+              completedAt: new Date().toISOString(),
+            })
+          );
+          continue;
+        }
+
+        const controller = new AbortController();
+        batchAbortRef.current = controller;
+
+        updateBatchQueueState((prev) =>
+          updateBatchQueueItem(prev, nextItem.id, {
+            status: 'running',
+            progressPercent: 8,
+            progressStage: 'queued',
+            startedAt: new Date().toISOString(),
+            error: undefined,
+            workerMessage: 'Odesílání sekvenční úlohy do OpenGen workeru…',
+          })
+        );
+
+        try {
+          const result = await smartVideoOrchestrator.generateOpenGenVideo(
+            {
+              modelId: nextItem.modelId,
+              mode: nextItem.mode,
+              prompt: nextItem.prompt,
+              negativePrompt: nextItem.negativePrompt || undefined,
+              aspectRatio: nextItem.format,
+              durationSec: nextItem.durationSec,
+              cameraMotion: nextItem.cameraMotion,
+              motionIntensity: nextItem.motionIntensity,
+              fps: nextItem.fps,
+              qualityTier: nextItem.qualityTier,
+              promptMagic: nextItem.promptMagic,
+              templateId: nextItem.templateId,
+              structuredPrompt: nextItem.structuredPrompt,
+            },
+            {
+              signal: controller.signal,
+              pollIntervalMs: 300,
+              onAccepted202: (initial) => {
+                if (nextItem.creditCost > 0) {
+                  creditsAvailableRef.current = Math.max(
+                    0,
+                    creditsAvailableRef.current - nextItem.creditCost
+                  );
+                  setCreditsState((prev) => ({
+                    ...prev,
+                    available: Math.max(0, prev.available - nextItem.creditCost),
+                    usedThisPeriod: prev.usedThisPeriod + nextItem.creditCost,
+                  }));
+                }
+                updateBatchQueueState((prev) =>
+                  updateBatchQueueItem(prev, nextItem.id, {
+                    progressPercent: initial.asset?.progressPercent ?? 15,
+                    progressStage: initial.asset?.progressStage || 'queued',
+                    workerMessage:
+                      initial.asset?.workerMessage || 'Worker přijal úlohu (HTTP 202).',
+                  })
+                );
+              },
+              onProgress: (update) => {
+                updateBatchQueueState((prev) =>
+                  updateBatchQueueItem(prev, nextItem.id, {
+                    progressPercent: update.progressPercent,
+                    progressStage: update.progressStage,
+                    workerMessage: update.workerMessage,
+                  })
+                );
+              },
+            }
+          );
+
+          if (!isBatchRunningRef.current) break;
+
+          if (result.creditsRemaining !== undefined) {
+            creditsAvailableRef.current = result.creditsRemaining;
+            setCreditsState((prev) => ({ ...prev, available: result.creditsRemaining! }));
+          }
+
+          updateBatchQueueState((prev) =>
+            updateBatchQueueItem(prev, nextItem.id, {
+              status: 'completed',
+              progressPercent: 100,
+              progressStage: 'ready',
+              workerMessage: 'MP4 video +faststart připraveno.',
+              asset: result.asset,
+              completedAt: new Date().toISOString(),
+            })
+          );
+
+          if (result.asset) {
+            setCurrentVideoAsset(result.asset);
+            if (result.asset.videoStoryboard) setCurrentStoryboard(result.asset.videoStoryboard);
+            if (result.asset.moviePyScript) setCurrentMoviePyScript(result.asset.moviePyScript);
+            if (result.asset.status === 'ready' && result.asset.streamUrl) {
+              setPreviewMode('mp4');
+            }
+          }
+          onRefreshAssets();
+        } catch (err: any) {
+          if (err?.name === 'AbortError') {
+            updateBatchQueueState((prev) =>
+              updateBatchQueueItem(prev, nextItem.id, {
+                status: 'cancelled',
+                workerMessage: 'Zpracování pozastaveno.',
+              })
+            );
+            break;
+          }
+          updateBatchQueueState((prev) =>
+            updateBatchQueueItem(prev, nextItem.id, {
+              status: 'failed',
+              error: err?.message || 'Generování úlohy v dávce selhalo.',
+              workerMessage: 'Úloha selhala.',
+              completedAt: new Date().toISOString(),
+            })
+          );
+        }
+      }
+    } finally {
+      batchAbortRef.current = null;
+      isBatchRunningRef.current = false;
+      setIsBatchRunning(false);
     }
   };
 
@@ -585,14 +1047,32 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     setPreviewMode('canvas');
 
     const activeModel = openGenModels.find((m) => m.id === selectedModelId) || openGenModels[0];
-    const cost = activeModel?.creditCost || 10;
+    const cost = activeModel ? activeModel.creditCost : 0;
 
-    if (creditsState.available < cost) {
-      setErrorMsg(`Nedostatek kreditů pro ${activeModel?.name || 'tento model'}. Potřebujete ${cost} kreditů, máte k dispozici ${creditsState.available}.`);
+    if (cost > 0 && creditsState.available < cost) {
+      setErrorMsg(
+        `Nedostatek kreditů pro ${activeModel?.name || 'tento model'}. Potřebujete ${cost} kreditů, máte k dispozici ${creditsState.available}.`
+      );
       setIsGenerating(false);
       setIsTopUpModalOpen(true);
       return;
     }
+
+    const syncedStructuredPrompt: StructuredVideoPrompt = {
+      ...structuredPrompt,
+      rawPrompt: topic,
+      aspectRatio: format,
+      fps: fps === 24 || fps === 60 ? fps : 30,
+      camera: {
+        ...structuredPrompt.camera,
+        primaryMotion: cameraMotion,
+        motionIntensity,
+      },
+      style: {
+        ...structuredPrompt.style,
+        negativePrompt,
+      },
+    };
 
     try {
       const result = await smartVideoOrchestrator.generateOpenGenVideo(
@@ -600,15 +1080,19 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           modelId: selectedModelId,
           mode: openGenMode,
           prompt: topic,
-          negativePrompt: showNegativePrompt ? negativePrompt : undefined,
+          negativePrompt: negativePrompt || undefined,
           aspectRatio: format,
-          durationSec: Math.min(activeModel?.maxDurationSec || 6, 6),
+          durationSec: Math.min(
+            activeModel?.maxDurationSec || 15,
+            syncedStructuredPrompt.totalDurationSec || 6
+          ),
           cameraMotion,
           motionIntensity,
           fps,
           qualityTier,
           promptMagic,
           templateId: selectedTemplateId,
+          structuredPrompt: syncedStructuredPrompt,
         },
         {
           signal: controller.signal,
@@ -616,12 +1100,15 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           onAccepted202: (initial) => {
             if (initial.storyboard) setCurrentStoryboard(initial.storyboard);
             if (initial.moviePyScript) setCurrentMoviePyScript(initial.moviePyScript);
+            if (initial.structuredPrompt) setStructuredPrompt(initial.structuredPrompt);
             if (initial.asset) setCurrentVideoAsset(initial.asset);
-            setCreditsState((prev) => ({
-              ...prev,
-              available: Math.max(0, prev.available - cost),
-              usedThisPeriod: prev.usedThisPeriod + cost,
-            }));
+            if (cost > 0) {
+              setCreditsState((prev) => ({
+                ...prev,
+                available: Math.max(0, prev.available - cost),
+                usedThisPeriod: prev.usedThisPeriod + cost,
+              }));
+            }
           },
           onProgress: (update) => {
             setRenderProgress(update);
@@ -631,6 +1118,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
 
       if (result.storyboard) setCurrentStoryboard(result.storyboard);
       if (result.moviePyScript) setCurrentMoviePyScript(result.moviePyScript);
+      if (result.structuredPrompt) setStructuredPrompt(result.structuredPrompt);
       if (result.asset) {
         setCurrentVideoAsset(result.asset);
         if (result.asset.status === 'ready' && result.asset.streamUrl) {
@@ -641,11 +1129,11 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
         setCreditsState((prev) => ({ ...prev, available: result.creditsRemaining! }));
       }
       onRefreshAssets();
-      setCurrentTime(0);
+      seekPreviewTime(0);
       setIsPlaying(true);
     } catch (err: any) {
       if (err?.name === 'AbortError') return;
-      setErrorMsg(err?.message || 'OpenGen generování videa selhalo.');
+      setErrorMsg(err?.message || 'Generování videa selhalo.');
     } finally {
       setIsGenerating(false);
     }
@@ -679,158 +1167,266 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
     }
   };
 
-  useEffect(() => {
-    let lastTimestamp: number | null = null;
+  const activeStructuredPrompt =
+    currentVideoAsset?.structuredPrompt || currentStoryboard?.structuredPrompt || structuredPrompt;
+  const previewDuration = Math.max(4, activeStructuredPrompt?.totalDurationSec || 42);
+  const activeStructuredPromptRef = useRef(activeStructuredPrompt);
+  const previewDurationRef = useRef(previewDuration);
+  const formatRef = useRef(format);
+  const beatIntervalRef = useRef(60 / (activeTemplate?.musicPreset?.bpm || 128));
 
-    const renderFrame = (now: number) => {
+  activeStructuredPromptRef.current = activeStructuredPrompt;
+  previewDurationRef.current = previewDuration;
+  formatRef.current = format;
+  beatIntervalRef.current = 60 / (activeTemplate?.musicPreset?.bpm || 128);
+  isPlayingRef.current = isPlaying;
+
+  const drawFrameRef = useRef<(timeSec: number) => void>(() => {});
+  drawFrameRef.current = (timeSec: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const sp = activeStructuredPromptRef.current;
+    const dur = previewDurationRef.current;
+    const activeFormat = formatRef.current;
+    const palette = VISUAL_STYLE_PALETTES[sp.style.visualStyle];
+
+    const beats = sp.temporal.beats || [];
+    let activeBeat: TemporalSceneBeat | null = null;
+    let beatProgress = 0;
+    let beatElapsed = 0;
+    for (const b of beats) {
+      if (timeSec >= b.startSec && timeSec < b.endSec) {
+        activeBeat = b;
+        beatElapsed = timeSec - b.startSec;
+        beatProgress = Math.max(0, Math.min(1, beatElapsed / Math.max(0.2, b.durationSec)));
+        break;
+      }
+    }
+    if (!activeBeat && beats.length > 0) {
+      activeBeat = beats[0];
+    }
+
+    const zoom = activeBeat
+      ? activeBeat.cameraZoomStart +
+        (activeBeat.cameraZoomEnd - activeBeat.cameraZoomStart) * beatProgress
+      : 1.0;
+    const panX = activeBeat ? activeBeat.cameraPanX * beatProgress * (width * 0.16) : 0;
+    const panY = activeBeat ? activeBeat.cameraPanY * beatProgress * (height * 0.14) : 0;
+    const isFpv = activeBeat?.cameraKeyframe === 'fpv_drone';
+    const isOrbit = activeBeat?.cameraKeyframe === 'orbit_360';
+    const bankAngle = isFpv
+      ? Math.sin(timeSec * 3.1) * 0.045
+      : isOrbit
+      ? Math.sin(timeSec * 1.4) * 0.025
+      : 0;
+
+    ctx.save();
+    const grad = ctx.createLinearGradient(0, 0, width, height);
+    grad.addColorStop(0, '#07090e');
+    grad.addColorStop(0.55, `${palette.accentColor}22`);
+    grad.addColorStop(1, '#05070a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.translate(width / 2 - panX, height / 2 - panY);
+    ctx.rotate(bankAngle);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-width / 2, -height / 2);
+
+    ctx.strokeStyle = `${palette.accentColor}24`;
+    ctx.lineWidth = 1;
+    const gridSize = 28;
+    const offsetX = ((panX * 0.6) % gridSize + gridSize) % gridSize;
+    const offsetY = ((panY * 0.6) % gridSize + gridSize) % gridSize;
+    for (let x = -gridSize; x < width + gridSize; x += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(x + offsetX, -gridSize);
+      ctx.lineTo(x + offsetX, height + gridSize);
+      ctx.stroke();
+    }
+    for (let y = -gridSize; y < height + gridSize; y += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(-gridSize, y + offsetY);
+      ctx.lineTo(width + gridSize, y + offsetY);
+      ctx.stroke();
+    }
+
+    const focusRadius = Math.min(width, height) * 0.22;
+    ctx.strokeStyle = `${palette.secondaryColor}55`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(width / 2, height * 0.44, focusRadius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    if (isOrbit) {
+      const dotAngle = timeSec * 2.4;
+      ctx.fillStyle = palette.accentColor;
+      ctx.beginPath();
+      ctx.arc(
+        width / 2 + Math.cos(dotAngle) * focusRadius,
+        height * 0.44 + Math.sin(dotAngle) * focusRadius,
+        4,
+        0,
+        Math.PI * 2
+      );
+      ctx.fill();
+    }
+    ctx.restore();
+
+    if (activeBeat && beatElapsed < 0.22 && timeSec > 0.05) {
+      const flashAlpha = (1 - beatElapsed / 0.22) * 0.35;
+      ctx.fillStyle =
+        activeBeat.transitionIn === 'glitch_flash'
+          ? `rgba(6, 182, 212, ${flashAlpha})`
+          : `rgba(255, 255, 255, ${flashAlpha * 0.7})`;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    ctx.fillStyle = `${palette.accentColor}66`;
+    const numBars = 22;
+    const barWidth = width / numBars - 3;
+    for (let i = 0; i < numBars; i++) {
+      const barHeight = Math.sin(timeSec * 7 + i * 0.55) * 14 + 18;
+      ctx.fillRect(i * (barWidth + 3) + 2, height - barHeight - 12, barWidth, barHeight);
+    }
+
+    const boxY = height * 0.22;
+    ctx.fillStyle = 'rgba(10, 12, 18, 0.86)';
+    ctx.strokeStyle = palette.accentColor;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.roundRect(width * 0.07, boxY, width * 0.86, height * 0.46, 8);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = palette.accentColor;
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    const phaseLabel = activeBeat
+      ? `${PHASE_LABELS[activeBeat.phase].toUpperCase()} · ${activeBeat.startSec.toFixed(1)}–${activeBeat.endSec.toFixed(1)}s`
+      : `${sp.totalDurationSec}s`;
+    ctx.fillText(phaseLabel, width / 2, boxY + 22);
+
+    ctx.fillStyle = palette.secondaryColor;
+    ctx.font = '10px monospace';
+    const camShort = activeBeat
+      ? `${CAMERA_MOTION_LABELS[activeBeat.cameraKeyframe].split('(')[0].trim()} · ${zoom.toFixed(2)}×`
+      : CAMERA_MOTION_LABELS[sp.camera.primaryMotion].split('(')[0].trim();
+    ctx.fillText(camShort, width / 2, boxY + 40);
+
+    const safeTextWidth = width * 0.86 - 24;
+    const wrapWords = (text: string, maxLines: number): string[] => {
+      const words = text.trim().split(/\s+/);
+      const lines: string[] = [];
+      let current = '';
+      for (const word of words) {
+        const candidate = current ? `${current} ${word}` : word;
+        if (ctx.measureText(candidate).width <= safeTextWidth) {
+          current = candidate;
+        } else {
+          if (current) lines.push(current);
+          current = word;
+          if (lines.length >= maxLines) break;
+        }
+      }
+      if (current && lines.length < maxLines) lines.push(current);
+      return lines.slice(0, maxLines);
+    };
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = activeFormat === '9:16' ? 'bold 13px ui-sans-serif, system-ui' : 'bold 15px ui-sans-serif, system-ui';
+    const headline = activeBeat?.kineticCaption || sp.subject.primarySubject;
+    const headlineLines = wrapWords(headline, 2);
+    headlineLines.forEach((line, idx) => {
+      ctx.fillText(line, width / 2, boxY + 68 + idx * 17);
+    });
+
+    ctx.fillStyle = 'rgba(228, 228, 231, 0.85)';
+    ctx.font = '11px ui-sans-serif';
+    const desc = activeBeat?.sceneDescription || sp.subject.subjectAction;
+    const descLines = wrapWords(desc, 3);
+    const descStartY = boxY + (headlineLines.length > 1 ? 110 : 98);
+    descLines.forEach((line, idx) => {
+      ctx.fillText(line, width / 2, descStartY + idx * 15);
+    });
+
+    ctx.fillStyle = 'rgba(161, 161, 170, 0.92)';
+    ctx.font = '9px monospace';
+    const opticsShort = OPTICS_LABELS[sp.style.optics].split('(')[0].trim();
+    const lightShort = LIGHTING_LABELS[sp.style.lighting].split('(')[0].trim();
+    let footerText = `${opticsShort} · ${lightShort}`;
+    while (ctx.measureText(footerText).width > safeTextWidth && footerText.length > 12) {
+      footerText = `${footerText.slice(0, -4)}...`;
+    }
+    ctx.fillText(footerText, width / 2, boxY + height * 0.41);
+
+    const progressPercent = Math.max(0, Math.min(1, timeSec / dur));
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.fillRect(0, 0, width, 4);
+    ctx.fillStyle = palette.accentColor;
+    ctx.fillRect(0, 0, width * progressPercent, 4);
+  };
+
+  useEffect(() => {
+    if (!isPlaying) {
+      drawFrameRef.current(currentTimeRef.current);
+      return;
+    }
+
+    let lastTimestamp: number | null = null;
+    let lastHudBucket = Math.floor(currentTimeRef.current * 10);
+
+    const step = (now: number) => {
+      if (!isPlayingRef.current) return;
       const delta =
         lastTimestamp === null ? 0 : Math.max(0, Math.min(0.1, (now - lastTimestamp) / 1000));
       lastTimestamp = now;
 
-      if (isPlaying) {
-        setCurrentTime((prev) => {
-          const next = Math.max(0, prev + delta);
-          const beatInterval = 60 / (activeTemplate?.musicPreset?.bpm || 128);
-          if (Math.floor(next / beatInterval) !== Math.floor(prev / beatInterval)) {
-            playSynthSound(Math.floor(next) % 2 === 0 ? 150 : 210, 'triangle', 0.08);
-          }
-          if (next >= 42) {
-            return 0;
-          }
-          return next;
-        });
+      const prev = currentTimeRef.current;
+      let next = Math.max(0, prev + delta);
+      const beatInterval = beatIntervalRef.current;
+      if (Math.floor(next / beatInterval) !== Math.floor(prev / beatInterval)) {
+        playSynthSound(Math.floor(next) % 2 === 0 ? 150 : 210, 'triangle', 0.08);
+      }
+      if (next >= previewDurationRef.current) {
+        next = 0;
+      }
+      currentTimeRef.current = next;
+      drawFrameRef.current(next);
+
+      const nextBucket = Math.floor(next * 10);
+      if (nextBucket !== lastHudBucket) {
+        lastHudBucket = nextBucket;
+        setCurrentTime(next);
       }
 
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const width = canvas.width;
-          const height = canvas.height;
-
-          const grad = ctx.createLinearGradient(0, 0, width, height);
-          const hueOffset = (currentTime * 15) % 360;
-          grad.addColorStop(0, '#0a0d14');
-          grad.addColorStop(0.5, `hsl(${220 + (hueOffset % 40)}, 40%, 12%)`);
-          grad.addColorStop(1, '#05070a');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, width, height);
-
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-          ctx.lineWidth = 1;
-          const gridSize = 32;
-          for (let x = 0; x < width; x += gridSize) {
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, height);
-            ctx.stroke();
-          }
-
-          const scenes = currentStoryboard?.scenes || [];
-          let activeScene: VideoScene | null = null;
-          let sceneElapsed = 0;
-          let accumSec = 0;
-
-          for (const s of scenes) {
-            if (currentTime >= accumSec && currentTime < accumSec + s.durationSec) {
-              activeScene = s;
-              sceneElapsed = currentTime - accumSec;
-              break;
-            }
-            accumSec += s.durationSec;
-          }
-          if (!activeScene && scenes.length > 0) {
-            activeScene = scenes[0];
-          }
-
-          ctx.fillStyle = 'rgba(16, 185, 129, 0.4)';
-          const numBars = 24;
-          const barWidth = width / numBars - 3;
-          for (let i = 0; i < numBars; i++) {
-            const barHeight = Math.sin(currentTime * 8 + i * 0.5) * 20 + 25;
-            ctx.fillRect(i * (barWidth + 3) + 2, height - barHeight - 15, barWidth, barHeight);
-          }
-
-          const boxY = height * 0.25;
-          ctx.fillStyle = 'rgba(18, 20, 28, 0.88)';
-          ctx.strokeStyle = activeTemplate?.subtitleStyle?.highlightColor || '#10b981';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.roundRect(width * 0.08, boxY, width * 0.84, height * 0.42, 8);
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.fillStyle = '#10b981';
-          ctx.font = 'bold 11px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText(
-            `${activeTemplate ? activeTemplate.visualStyle.toUpperCase() : 'SCÉNA'} · ${activeScene?.timeRange || '00:00 - 00:03'}`,
-            width / 2,
-            boxY + 24
-          );
-
-          if (activeScene?.patternInterrupt) {
-            ctx.fillStyle = '#f59e0b';
-            ctx.font = '10px monospace';
-            ctx.fillText(activeScene.patternInterrupt.slice(0, 34).toUpperCase(), width / 2, boxY + 44);
-          }
-
-          const highlightCol = activeTemplate?.subtitleStyle?.highlightColor || '#facc15';
-          const defaultSubCol = activeTemplate?.subtitleStyle?.color || '#ffffff';
-
-          if (activeScene) {
-            const words = activeScene.kineticText.split(' ');
-            const wordIdx = Math.floor(sceneElapsed * 3) % words.length;
-
-            ctx.font = format === '9:16' ? 'bold 20px ui-sans-serif, system-ui' : 'bold 18px ui-sans-serif, system-ui';
-            ctx.textAlign = 'center';
-
-            words.forEach((w, idx) => {
-              const isHighlighted = idx === wordIdx;
-              ctx.fillStyle = isHighlighted ? highlightCol : defaultSubCol;
-              ctx.shadowColor = isHighlighted ? highlightCol : 'transparent';
-              ctx.shadowBlur = isHighlighted ? 12 : 0;
-
-              const lineY = boxY + 86 + idx * 28;
-              if (lineY < boxY + height * 0.39) {
-                ctx.fillText(w, width / 2, lineY);
-              }
-            });
-            ctx.shadowBlur = 0;
-          }
-
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
-          ctx.font = '11px ui-sans-serif';
-          ctx.textAlign = 'center';
-          const voiceoverText = activeScene?.audioVoiceover || '';
-          if (voiceoverText.length > 50) {
-            ctx.fillText(`"${voiceoverText.substring(0, 48)}..."`, width / 2, height * 0.74);
-          } else {
-            ctx.fillText(`"${voiceoverText}"`, width / 2, height * 0.74);
-          }
-
-          const progressPercent = currentTime / 42;
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-          ctx.fillRect(0, 0, width, 4);
-          ctx.fillStyle = '#10b981';
-          ctx.fillRect(0, 0, width * progressPercent, 4);
-        }
-      }
-
-      animationFrameRef.current = requestAnimationFrame(renderFrame);
+      animationFrameRef.current = requestAnimationFrame(step);
     };
 
-    animationFrameRef.current = requestAnimationFrame(renderFrame);
+    animationFrameRef.current = requestAnimationFrame(step);
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [isPlaying, currentTime, isMuted, currentStoryboard, format, activeTemplate]);
+  }, [isPlaying]);
 
-  const copyScriptToClipboard = () => {
+  useEffect(() => {
+    if (!isPlaying) {
+      drawFrameRef.current(currentTimeRef.current);
+    }
+  }, [isPlaying, currentTime, isMuted, currentStoryboard, format, activeTemplate, activeStructuredPrompt, previewDuration]);
+
+  const copyScriptToClipboard = async () => {
     if (!currentMoviePyScript) return;
-    navigator.clipboard.writeText(currentMoviePyScript);
-    setCopiedScript(true);
-    setTimeout(() => setCopiedScript(false), 2000);
+    const ok = await copyTextSafely(currentMoviePyScript);
+    if (ok) {
+      setCopiedScript(true);
+      setTimeout(() => setCopiedScript(false), 2000);
+    }
   };
 
   const downloadPythonScript = () => {
@@ -857,18 +1453,18 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-zinc-800/80 pb-4">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded bg-gradient-to-r from-emerald-500/20 via-cyan-500/20 to-purple-500/20 border border-emerald-500/40 px-2.5 py-0.5 text-[10px] font-bold text-emerald-300 font-mono tracking-wider">
-              OPENGEN.AI/CS · VŠECHNY ŠPIČKOVÉ AI MODELY
+            <span className="rounded bg-emerald-500/15 border border-emerald-500/40 px-2.5 py-0.5 text-[10px] font-bold text-emerald-300 font-mono tracking-wider">
+              LOKÁLNÍ CHYTRÝ REŽISÉR · ZERO-API + OPENGEN STUDIO
             </span>
             <span className="text-zinc-500 font-mono text-[11px] hidden sm:inline">
-              Veo 3.1 · Runway Gen-4.5 · Hailuo 2.3 · Kling 4.0 · Wan 2.1 · Mochi 1
+              Subjekt · Styl · Pohyb kamery · Časový vývoj scény · FFmpeg +faststart
             </span>
           </div>
           <h1 className="text-xl font-bold text-white mt-1">
-            OpenGen AI Video Studio &amp; Multi-Model Generátor
+            Strukturované Text-to-Video Studio &amp; MoviePy Pipeline
           </h1>
           <p className="text-xs text-zinc-400 mt-1 max-w-2xl font-mono">
-            Všechny přední generativní modely pro video i obrázky na jednom místě. Text-to-Video, Image-to-Video, kinematografická kamera, MoviePy automatizace a přímá publikace.
+            Plně lokální chytré generování bez externích či placených API. Strukturovaný prompt přesně řídí subjekt, optický styl, kinematografický pohyb kamery a fázový vývoj scény v čase.
           </p>
         </div>
 
@@ -904,7 +1500,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           {/* OpenGen Credits Meter & Top-Up Button */}
           <div className="flex items-center rounded-lg border border-amber-500/40 bg-amber-950/20 px-2.5 py-1 gap-2">
             <div className="flex items-center gap-1.5 text-amber-300">
-              <Coins className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
+              <Coins className="h-3.5 w-3.5 text-amber-400" />
               <span className="font-bold tabular-nums text-xs">{creditsState.available}</span>
               <span className="text-[10px] text-amber-400/80">kreditů</span>
             </div>
@@ -955,15 +1551,34 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
             </button>
           )}
 
+          {currentVideoAsset && (
+            <button
+              type="button"
+              data-testid="open-asset-review-btn"
+              onClick={() => setReviewModalAsset(currentVideoAsset)}
+              className="flex items-center gap-1.5 rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 font-bold text-cyan-300 hover:bg-cyan-500/20 whitespace-nowrap transition"
+            >
+              <Eye className="h-3.5 w-3.5" />
+              <span>Zkontrolovat asset</span>
+            </button>
+          )}
+
           {onOpenPublish && (
             <button
               type="button"
               disabled={!canPublish}
               onClick={() =>
                 onOpenPublish(
-                  currentStoryboard?.title || topic,
+                  structuredPrompt.monetizationKit?.seoTitle || currentStoryboard?.title || topic,
                   format,
-                  activeTemplate?.category || 'viral_hook'
+                  activeTemplate?.category || 'viral_hook',
+                  {
+                    assetId: currentVideoAsset?.id,
+                    description: structuredPrompt.monetizationKit
+                      ? `${structuredPrompt.monetizationKit.hookLine}\n\n${structuredPrompt.monetizationKit.ctaLine}`
+                      : currentVideoAsset?.body,
+                    tags: structuredPrompt.monetizationKit?.brandSafeTags || currentVideoAsset?.tags,
+                  }
                 )
               }
               className="flex items-center gap-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-black px-3.5 py-1.5 font-bold whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed transition"
@@ -1001,156 +1616,222 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-cyan-400" />
               <span className="font-bold text-white uppercase text-[11px]">
-                OPENGEN.AI MODELY ({openGenModels.length > 0 ? openGenModels.length : 10}) · VŠECHNY ŠPIČKOVÉ AI MODELY NA JEDNOM MÍSTĚ
+                REŽIM GENEROVÁNÍ ({openGenModels.length > 0 ? openGenModels.length : 11}) · LOKÁLNÍ REŽISÉR BEZ API &amp; MODELY
               </span>
             </div>
             <div className="flex items-center gap-2 text-zinc-400 text-[11px]">
-              <span>Aktivní model:</span>
+              <span>Aktivní engine:</span>
               <span className="font-bold text-cyan-300">
-                {openGenModels.find((m) => m.id === selectedModelId)?.name || 'Google Veo 3.1'}
+                {openGenModels.find((m) => m.id === selectedModelId)?.name || 'Lokální Chytrý Režisér (Bez API)'}
               </span>
             </div>
           </div>
 
-          {/* Model Cards Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
-            {(openGenModels.length > 0
-              ? openGenModels
-              : [
-                  {
-                    id: 'veo-3-1',
-                    name: 'Google Veo 3.1',
-                    provider: 'Google DeepMind',
-                    badge: '4K CINEMA',
-                    creditCost: 12,
-                    description: 'Fotorealistická fyzika, světlo a kinematografická kamera.',
-                    features: ['4K HDR', 'Prompt Magic', 'Camera Motion'],
-                  },
-                  {
-                    id: 'runway-gen-4-5',
-                    name: 'Runway Gen-4.5',
-                    provider: 'Runway',
-                    badge: 'DIRECTOR PRO',
-                    creditCost: 14,
-                    description: 'Hollywoodský režijní model s přesnou kontrolou klíčových snímků.',
-                    features: ['Director Keyframes', 'Multi-Brush'],
-                  },
-                  {
-                    id: 'minimax-hailuo-2-3',
-                    name: 'MiniMax Hailuo 2.3',
-                    provider: 'MiniMax',
-                    badge: 'HYPER-FAST',
-                    creditCost: 8,
-                    description: 'Bleskurychlý lidský pohyb a bezkonkurenční mimika.',
-                    features: ['Realistic Faces', 'Fast Render'],
-                  },
-                  {
-                    id: 'kling-o3',
-                    name: 'Kling 4.0 / O3',
-                    provider: 'Kuaishou',
-                    badge: 'MULTI-CAM',
-                    creditCost: 10,
-                    description: 'Multi-kamera simulace, fluidní dynamika a 3D trajektorie.',
-                    features: ['Fluid Dynamics', '3D Motion'],
-                  },
-                  {
-                    id: 'luma-ray-v3-2',
-                    name: 'Luma Ray v3.2',
-                    provider: 'Luma AI',
-                    badge: 'SMOOTH MOTION',
-                    creditCost: 7,
-                    description: '3D volumetrické svícení a plynulý dronový průlet.',
-                    features: ['Drone Paths', 'Loop Video'],
-                  },
-                  {
-                    id: 'seedance-2-5',
-                    name: 'Seedance 2.5',
-                    provider: 'OpenGen',
-                    badge: 'ACTION BEAT',
-                    creditCost: 6,
-                    description: 'Energický tanec, sportovní akce a kinetický střih.',
-                    features: ['Music Sync', 'Sports Motion'],
-                  },
-                  {
-                    id: 'gemini-omni-flash',
-                    name: 'Gemini Omni Flash',
-                    provider: 'Google',
-                    badge: 'MULTIMODAL',
-                    creditCost: 9,
-                    description: 'Multimodální video reasoning s českým kontextem.',
-                    features: ['Czech Nuance', 'Voice Sync'],
-                  },
-                  {
-                    id: 'wan-2-1',
-                    name: 'Wan 2.1 MoE',
-                    provider: 'Alibaba Wan-AI',
-                    badge: 'OPEN-WEIGHTS',
-                    creditCost: 5,
-                    description: 'Špičkový open-weights model s MoE architekturou.',
-                    features: ['Open-Weights', 'Low Cost'],
-                  },
-                  {
-                    id: 'hunyuan-video',
-                    name: 'HunyuanVideo',
-                    provider: 'Tencent',
-                    badge: 'OPEN SOURCE',
-                    creditCost: 5,
-                    description: 'Velký open-source model s kinematografickou hloubkou.',
-                    features: ['High Prompt Adherence', 'Open'],
-                  },
-                  {
-                    id: 'flux-2-pro',
-                    name: 'Flux 2 Pro',
-                    provider: 'Black Forest Labs',
-                    badge: 'IMAGE BASE',
-                    creditCost: 3,
-                    description: 'Fotorealistické klíčové snímky pro Image-to-Video.',
-                    features: ['Photo Realism', 'Keyframe Anchor'],
-                  },
-                ]
-            ).map((model) => {
-              const isSelected = model.id === selectedModelId;
-              return (
-                <button
-                  key={model.id}
-                  type="button"
-                  onClick={() => setSelectedModelId(model.id)}
-                  className={`text-left rounded-lg border p-3 transition flex flex-col justify-between ${
-                    isSelected
-                      ? 'border-cyan-400 bg-cyan-950/40 shadow-lg shadow-cyan-950/50 ring-1 ring-cyan-400/50'
-                      : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
-                  }`}
-                >
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between gap-1.5">
-                      <span className="font-bold text-white text-xs truncate">{model.name}</span>
-                      <span className="rounded bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.2 text-[9px] font-bold text-cyan-300 shrink-0">
-                        {model.badge || 'PRO'}
-                      </span>
-                    </div>
-                    <div className="text-[10px] text-zinc-400 flex items-center justify-between">
-                      <span className="truncate">{model.provider}</span>
-                      <span className="text-amber-400 font-bold shrink-0">{model.creditCost} kreditů</span>
-                    </div>
-                    <p className="text-[10px] text-zinc-400 line-clamp-2 leading-relaxed">
-                      {model.description}
-                    </p>
-                  </div>
+          {/* Featured Local Zero-API Director + Symmetrical 5x2 Multi-Model Grid */}
+          {(() => {
+            const allModels =
+              openGenModels.length > 0
+                ? openGenModels
+                : [
+                    {
+                      id: 'nexus-local-director',
+                      name: 'Lokální Chytrý Režisér (Bez API)',
+                      provider: 'NEXUS Local Engine',
+                      badge: 'ZERO-API LOCAL',
+                      creditCost: 0,
+                      description:
+                        'Deterministický 4-pilířový režisér: subjekt, styl, pohyb kamery a časový vývoj scény bez externích či placených API.',
+                      features: ['0 Kreditů', '4-Pillar NLP', 'FFmpeg +faststart'],
+                    },
+                    {
+                      id: 'veo-3-1',
+                      name: 'Google Veo 3.1',
+                      provider: 'Google DeepMind',
+                      badge: '4K CINEMA',
+                      creditCost: 12,
+                      description: 'Fotorealistická fyzika, světlo a kinematografická kamera.',
+                      features: ['4K HDR', 'Prompt Magic', 'Camera Motion'],
+                    },
+                    {
+                      id: 'runway-gen-4-5',
+                      name: 'Runway Gen-4.5',
+                      provider: 'Runway',
+                      badge: 'DIRECTOR PRO',
+                      creditCost: 14,
+                      description: 'Hollywoodský režijní model s přesnou kontrolou klíčových snímků.',
+                      features: ['Director Keyframes', 'Multi-Brush'],
+                    },
+                    {
+                      id: 'minimax-hailuo-2-3',
+                      name: 'MiniMax Hailuo 2.3',
+                      provider: 'MiniMax',
+                      badge: 'HYPER-FAST',
+                      creditCost: 8,
+                      description: 'Bleskurychlý lidský pohyb a bezkonkurenční mimika.',
+                      features: ['Realistic Faces', 'Fast Render'],
+                    },
+                    {
+                      id: 'kling-o3',
+                      name: 'Kling 4.0 / O3',
+                      provider: 'Kuaishou',
+                      badge: 'MULTI-CAM',
+                      creditCost: 10,
+                      description: 'Multi-kamera simulace, fluidní dynamika a 3D trajektorie.',
+                      features: ['Fluid Dynamics', '3D Motion'],
+                    },
+                    {
+                      id: 'luma-ray-v3-2',
+                      name: 'Luma Ray v3.2',
+                      provider: 'Luma AI',
+                      badge: 'SMOOTH MOTION',
+                      creditCost: 7,
+                      description: '3D volumetrické svícení a plynulý dronový průlet.',
+                      features: ['Drone Paths', 'Loop Video'],
+                    },
+                    {
+                      id: 'seedance-2-5',
+                      name: 'Seedance 2.5',
+                      provider: 'OpenGen',
+                      badge: 'ACTION BEAT',
+                      creditCost: 6,
+                      description: 'Energický tanec, sportovní akce a kinetický střih.',
+                      features: ['Music Sync', 'Sports Motion'],
+                    },
+                    {
+                      id: 'gemini-omni-flash',
+                      name: 'Gemini Omni Flash',
+                      provider: 'Google',
+                      badge: 'MULTIMODAL',
+                      creditCost: 9,
+                      description: 'Multimodální video reasoning s českým kontextem.',
+                      features: ['Czech Nuance', 'Voice Sync'],
+                    },
+                    {
+                      id: 'wan-2-1',
+                      name: 'Wan 2.1 MoE',
+                      provider: 'Alibaba Wan-AI',
+                      badge: 'OPEN-WEIGHTS',
+                      creditCost: 5,
+                      description: 'Špičkový open-weights model s MoE architekturou.',
+                      features: ['Open-Weights', 'Low Cost'],
+                    },
+                    {
+                      id: 'hunyuan-video',
+                      name: 'HunyuanVideo',
+                      provider: 'Tencent',
+                      badge: 'OPEN SOURCE',
+                      creditCost: 5,
+                      description: 'Velký open-source model s kinematografickou hloubkou.',
+                      features: ['High Prompt Adherence', 'Open'],
+                    },
+                    {
+                      id: 'flux-2-pro',
+                      name: 'Flux 2 Pro',
+                      provider: 'Black Forest Labs',
+                      badge: 'IMAGE BASE',
+                      creditCost: 3,
+                      description: 'Fotorealistické klíčové snímky pro Image-to-Video.',
+                      features: ['Photo Realism', 'Keyframe Anchor'],
+                    },
+                  ];
 
-                  <div className="mt-2 pt-2 border-t border-zinc-800/80 flex flex-wrap gap-1 text-[9px] text-zinc-500">
-                    {model.features.slice(0, 2).map((feat) => (
-                      <span
-                        key={feat}
-                        className="rounded bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-zinc-400"
+            const localEngine = allModels.find((m) => m.id === 'nexus-local-director');
+            const cloudModels = allModels.filter((m) => m.id !== 'nexus-local-director');
+
+            return (
+              <div className="space-y-3">
+                {localEngine && (
+                  <button
+                    type="button"
+                    data-testid="model-card-nexus-local-director"
+                    onClick={() => setSelectedModelId(localEngine.id)}
+                    className={`w-full text-left rounded-lg border p-3.5 transition flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${
+                      selectedModelId === localEngine.id
+                        ? 'border-emerald-400 bg-emerald-950/35 shadow-lg shadow-emerald-950/40 ring-1 ring-emerald-400/50'
+                        : 'border-zinc-800 bg-zinc-950 hover:border-emerald-500/50'
+                    }`}
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Cpu className="h-4 w-4 text-emerald-400 shrink-0" />
+                        <span className="font-bold text-white text-sm">{localEngine.name}</span>
+                        <span className="rounded bg-emerald-500/15 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
+                          {localEngine.badge || 'ZERO-API LOCAL'}
+                        </span>
+                        <span className="text-[11px] font-bold text-emerald-400">
+                          0 kreditů · Lokálně bez placených/externích API
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-zinc-300 leading-relaxed">
+                        {localEngine.description}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                      {localEngine.features.map((feat) => (
+                        <span
+                          key={feat}
+                          className="rounded bg-zinc-900 border border-zinc-800 px-2 py-0.5 text-[10px] text-emerald-200 whitespace-nowrap"
+                        >
+                          {feat}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+                  {cloudModels.map((model) => {
+                    const isSelected = model.id === selectedModelId;
+                    return (
+                      <button
+                        key={model.id}
+                        type="button"
+                        onClick={() => setSelectedModelId(model.id)}
+                        className={`text-left rounded-lg border p-3 transition flex flex-col justify-between ${
+                          isSelected
+                            ? 'border-cyan-400 bg-cyan-950/40 shadow-lg shadow-cyan-950/50 ring-1 ring-cyan-400/50'
+                            : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+                        }`}
                       >
-                        {feat}
-                      </span>
-                    ))}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="font-bold text-white text-xs truncate">{model.name}</span>
+                            <span className="rounded bg-cyan-500/15 border border-cyan-500/30 px-1.5 py-0.2 text-[9px] font-bold text-cyan-300 shrink-0">
+                              {model.badge || 'PRO'}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-zinc-400 flex items-center justify-between">
+                            <span className="truncate">{model.provider}</span>
+                            <span
+                              className={`font-bold shrink-0 ${
+                                model.creditCost === 0 ? 'text-emerald-400' : 'text-amber-400'
+                              }`}
+                            >
+                              {model.creditCost === 0 ? '0 kreditů (Zdarma)' : `${model.creditCost} kreditů`}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-zinc-400 line-clamp-2 leading-relaxed">
+                            {model.description}
+                          </p>
+                        </div>
+
+                        <div className="mt-2 pt-2 border-t border-zinc-800/80 flex flex-wrap gap-1 text-[9px] text-zinc-500">
+                          {model.features.slice(0, 2).map((feat) => (
+                            <span
+                              key={feat}
+                              className="rounded bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-zinc-400"
+                            >
+                              {feat}
+                            </span>
+                          ))}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* OPENGEN DIRECT GENERATION CONTROLS */}
           <div
@@ -1214,153 +1895,159 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                     </button>
                   ))}
                 </div>
-              </div>
-            </div>
 
-            {/* Camera Motion & Motion Intensity */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <label className="block space-y-1">
-                <span className="text-[11px] text-zinc-400 flex items-center gap-1.5">
-                  <Camera className="h-3.5 w-3.5 text-cyan-400" />
-                  <span>Kinematografický pohyb kamery (OpenGen Camera Motion):</span>
-                </span>
-                <select
-                  value={cameraMotion}
-                  onChange={(e) => setCameraMotion(e.target.value as OpenGenCameraMotion)}
-                  className="w-full rounded border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500"
+                <button
+                  type="button"
+                  data-testid="toggle-prompt-magic"
+                  onClick={() => setPromptMagic((v) => !v)}
+                  className={`flex items-center gap-1 rounded border px-2 py-1 font-bold transition ${
+                    promptMagic
+                      ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white'
+                  }`}
                 >
-                  <option value="orbit_360">Orbitální rotace 360° (Orbit 360)</option>
-                  <option value="zoom_in">Plynulý dramatický nájezd (Dolly Zoom In)</option>
-                  <option value="zoom_out">Plynulý odjezd (Dolly Zoom Out)</option>
-                  <option value="pan_left">Švenk vlevo (Pan Left)</option>
-                  <option value="pan_right">Švenk vpravo (Pan Right)</option>
-                  <option value="tilt_up">Náklon kamery nahoru (Tilt Up)</option>
-                  <option value="tilt_down">Náklon kamery dolů (Tilt Down)</option>
-                  <option value="fpv_drone">Dynamický FPV Dronový průlet</option>
-                  <option value="static">Statická studiová kamera (Tripod)</option>
-                </select>
-              </label>
-
-              <div className="space-y-1">
-                <div className="flex items-center justify-between text-[11px] text-zinc-400">
-                  <span className="flex items-center gap-1.5">
-                    <SlidersHorizontal className="h-3.5 w-3.5 text-amber-400" />
-                    <span>Intenzita pohybu (Motion Strength):</span>
-                  </span>
-                  <span className="font-bold text-white tabular-nums">{motionIntensity} / 10</span>
-                </div>
-                <input
-                  type="range"
-                  min="1"
-                  max="10"
-                  step="1"
-                  value={motionIntensity}
-                  onChange={(e) => setMotionIntensity(Number(e.target.value))}
-                  className="w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded"
-                />
+                  <Sparkles className="h-3 w-3" />
+                  <span>Prompt Magic: {promptMagic ? 'ZAP' : 'VYP'}</span>
+                </button>
               </div>
             </div>
 
-            {/* Prompt Editor & Magic Prompt */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] text-zinc-400">Prompt pro video:</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={isEnhancingPrompt || !topic.trim()}
-                    onClick={handlePromptEnhance}
-                    className="flex items-center gap-1 rounded border border-purple-500/40 bg-purple-500/10 hover:bg-purple-500/20 px-2.5 py-0.5 text-[11px] text-purple-300 transition"
-                    title="Obohatí prompt o optiku, anamorfní skla a filmové nasvícení"
-                  >
-                    <Wand2 className={`h-3 w-3 ${isEnhancingPrompt ? 'animate-spin' : ''}`} />
-                    <span>{isEnhancingPrompt ? 'Vylepšuji...' : 'Prompt Magic'}</span>
-                  </button>
+            {/* 4-Pillar Structured Text-to-Video Engine Controls */}
+            <StructuredPromptBuilder
+              value={structuredPrompt}
+              rawPrompt={topic}
+              onRawPromptChange={(nextText) => setTopic(nextText)}
+              onChange={handleStructuredPromptChange}
+              onSmartParse={handleSmartParsePrompt}
+              onSmartEnhance={handleSmartEnhancePrompt}
+              onAiSmartEnhance={handleAiSmartEnhancePrompt}
+              isProcessing={isStructuringPrompt}
+              isAiEnhancing={isAiEnhancing}
+              aiEnhanceNotes={aiEnhanceNotes}
+            />
 
-                  <button
-                    type="button"
-                    onClick={() => setShowNegativePrompt(!showNegativePrompt)}
-                    className="text-zinc-500 hover:text-zinc-300 text-[11px]"
-                  >
-                    {showNegativePrompt ? 'Skrýt negativní prompt' : '+ Negativní prompt'}
-                  </button>
-                </div>
-              </div>
-
-              <textarea
-                rows={2}
-                value={topic}
-                onChange={(e) => setTopic(e.target.value)}
-                placeholder="Popište scénu (např. 'Záběr z dronu na neonové futuristické studio v Praze, fotorealistické světlo, déšť na skle')..."
-                className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-cyan-500 font-mono resize-none"
-              />
-
-              {showNegativePrompt && (
-                <div className="space-y-1 pt-1">
-                  <span className="text-[10px] text-zinc-500">Negativní prompt (vyřadit z videa):</span>
-                  <input
-                    type="text"
-                    value={negativePrompt}
-                    onChange={(e) => setNegativePrompt(e.target.value)}
-                    placeholder="artefakty, rozmazání, deformace, nízká kvalita..."
-                    className="w-full rounded border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[11px] text-zinc-300 focus:outline-none focus:border-zinc-700 font-mono"
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* Action Row: Estimated Credits + Generate Button */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2 border-t border-zinc-800/80">
-              <div className="flex items-center gap-2 text-[11px] text-zinc-400">
-                <span className="flex items-center gap-1 text-amber-300 font-bold">
-                  <Coins className="h-3.5 w-3.5 text-amber-400" />
-                  <span>
-                    Spotřeba:{' '}
-                    {openGenModels.find((m) => m.id === selectedModelId)?.creditCost || 10} kreditů
-                  </span>
-                </span>
-                <span>·</span>
-                <span>
-                  Zůstatek po generování:{' '}
-                  {Math.max(
-                    0,
-                    creditsState.available -
-                      (openGenModels.find((m) => m.id === selectedModelId)?.creditCost || 10)
-                  )}{' '}
-                  kreditů
-                </span>
-              </div>
-
-              <button
-                type="button"
-                data-testid="opengen-generate-btn"
-                disabled={!canCreateVideos || isGenerating || !topic.trim()}
-                onClick={handleOpenGenGenerate}
-                className="flex items-center justify-center gap-2 rounded bg-gradient-to-r from-cyan-400 to-emerald-400 px-6 py-2.5 font-mono text-xs font-bold text-black hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition shrink-0 shadow-lg shadow-cyan-950/40"
-              >
-                {isGenerating ? (
-                  <>
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    <span>
-                      {renderProgress?.httpStatus === 202
-                        ? `OPENGEN WORKER ${renderProgress.progressPercent}%...`
-                        : 'GENEROVÁNÍ VIDEA...'}
+            {/* Action Row: Estimated Credits + Enqueue & Generate Buttons */}
+            {(() => {
+              const currentModel = openGenModels.find((m) => m.id === selectedModelId);
+              const cost = currentModel ? currentModel.creditCost : 0;
+              return (
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2 border-t border-zinc-800/80">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-400 tabular-nums">
+                    <span
+                      className={`flex items-center gap-1 font-bold ${
+                        cost === 0 ? 'text-emerald-400' : 'text-amber-300'
+                      }`}
+                    >
+                      <Coins className="h-3.5 w-3.5" />
+                      <span>
+                        {cost === 0
+                          ? 'Spotřeba: 0 kreditů (Lokální render bez API)'
+                          : `Spotřeba: ${cost} kreditů`}
+                      </span>
                     </span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="h-3.5 w-3.5" />
+                    <span>·</span>
                     <span>
-                      GENEROVAT PŘES{' '}
-                      {(openGenModels.find((m) => m.id === selectedModelId)?.name || 'VEO 3.1').toUpperCase()}{' '}
-                      ({openGenModels.find((m) => m.id === selectedModelId)?.creditCost || 10} KREDITŮ)
+                      Zůstatek po generování:{' '}
+                      {Math.max(0, creditsState.available - cost)} kreditů
                     </span>
-                  </>
-                )}
-              </button>
-            </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="opengen-enqueue-btn"
+                      disabled={!canCreateVideos || !topic.trim()}
+                      onClick={handleAddCurrentToBatchQueue}
+                      className="flex items-center justify-center gap-1.5 rounded border border-cyan-500/50 bg-cyan-950/30 hover:bg-cyan-900/40 px-3.5 py-2.5 font-mono text-xs font-bold text-cyan-200 disabled:opacity-40 disabled:cursor-not-allowed transition whitespace-nowrap"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>Do dávky</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="opengen-generate-btn"
+                      disabled={!canCreateVideos || isGenerating || !topic.trim()}
+                      onClick={handleOpenGenGenerate}
+                      className="flex items-center justify-center gap-2 rounded bg-gradient-to-r from-cyan-400 to-emerald-400 px-6 py-2.5 font-mono text-xs font-bold text-black hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition shrink-0 shadow-lg shadow-cyan-950/40 whitespace-nowrap"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                          <span>
+                            {renderProgress?.httpStatus === 202
+                              ? `WORKER ${renderProgress.progressPercent}%...`
+                              : 'GENEROVÁNÍ VIDEA...'}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="h-3.5 w-3.5" />
+                          <span>
+                            VYGENEROVAT VIDEO ·{' '}
+                            {(currentModel?.name || 'LOKÁLNÍ CHYTRÝ REŽISÉR').toUpperCase()}{' '}
+                            ({cost === 0 ? 'ZDARMA · 0 KREDITŮ' : `${cost} KREDITŮ`})
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
+      )}
+
+      {/* SEQUENTIAL BATCH PROCESSING QUEUE */}
+      {studioMode === 'opengen' && (
+        <BatchQueuePanel
+          queue={batchQueue}
+          isRunning={isBatchRunning}
+          canCreateVideos={canCreateVideos}
+          availableCredits={creditsState.available}
+          models={openGenModels}
+          defaultModelId={selectedModelId}
+          defaultTemplateId={selectedTemplateId}
+          onAddCurrentToQueue={handleAddCurrentToBatchQueue}
+          onAddCustomTask={handleAddCustomBatchTask}
+          onRemoveItem={(id) =>
+            updateBatchQueueState((prev) => removeBatchQueueItem(prev, id))
+          }
+          onMoveItem={(id, dir) =>
+            updateBatchQueueState((prev) => moveBatchQueueItem(prev, id, dir))
+          }
+          onRetryItem={(id) =>
+            updateBatchQueueState((prev) => retryBatchQueueItem(prev, id))
+          }
+          onClearFinished={() =>
+            updateBatchQueueState((prev) => clearFinishedBatchItems(prev))
+          }
+          onStartBatch={handleStartBatchQueue}
+          onPauseBatch={handlePauseBatchQueue}
+          onReviewAsset={(asset) => setReviewModalAsset(asset)}
+        />
+      )}
+
+      {/* MONETIZATION CHEATSHEETS, 100% AUDIT & HARDCORE REALISM RIG */}
+      {studioMode === 'opengen' && (
+        <MonetizationCheatsheetsPanel
+          structuredPrompt={structuredPrompt}
+          currentAsset={currentVideoAsset}
+          onApplyPrompt={handleApplyMonetizedPrompt}
+          onSyncToPublish={
+            onOpenPublish
+              ? (title, fmt) =>
+                  onOpenPublish(title, fmt, activeTemplate?.category || 'viral_hook', {
+                    assetId: currentVideoAsset?.id,
+                    description: structuredPrompt.monetizationKit
+                      ? `${structuredPrompt.monetizationKit.hookLine}\n\n${structuredPrompt.monetizationKit.ctaLine}`
+                      : undefined,
+                    tags: structuredPrompt.monetizationKit?.brandSafeTags,
+                  })
+              : undefined
+          }
+        />
       )}
 
       {/* COMPREHENSIVE VIDEO STYLES & TEMPLATES LIBRARY (when studioMode === 'moviepy') */}
@@ -1839,12 +2526,23 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                 <span className="text-emerald-400 font-bold">
                   {currentVideoAsset.faststartVerified ? 'FFmpeg -movflags +faststart ✓' : 'MP4 Stream Ready'}
                 </span>
-                <span>
-                  {currentVideoAsset.resolution || format} ·{' '}
-                  {currentVideoAsset.sizeBytes
-                    ? `${Math.round(currentVideoAsset.sizeBytes / 1024)} KB`
-                    : 'H.264/AAC'}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span>
+                    {currentVideoAsset.resolution || format} ·{' '}
+                    {currentVideoAsset.sizeBytes
+                      ? `${Math.round(currentVideoAsset.sizeBytes / 1024)} KB`
+                      : 'H.264/AAC'}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="player-review-asset-btn"
+                    onClick={() => setReviewModalAsset(currentVideoAsset)}
+                    className="inline-flex items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/15 px-2 py-0.5 text-[10px] font-bold text-cyan-300 hover:bg-cyan-500/25 whitespace-nowrap transition"
+                  >
+                    <Eye className="h-3 w-3" />
+                    <span>Detail &amp; QA</span>
+                  </button>
+                </div>
               </div>
             </div>
           ) : (
@@ -1885,18 +2583,18 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                   {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5 fill-current ml-0.5" />}
                 </button>
 
-                <span className="text-zinc-300 text-[11px] w-14 text-center">
-                  {Math.floor(currentTime)}s / 42s
+                <span className="text-zinc-300 text-[11px] w-16 text-center">
+                  {Math.floor(currentTime)}s / {Math.round(previewDuration)}s
                 </span>
 
                 <input
                   type="range"
                   aria-label="Časová osa videa"
                   min="0"
-                  max="42"
+                  max={previewDuration}
                   step="0.5"
-                  value={currentTime}
-                  onChange={(e) => setCurrentTime(parseFloat(e.target.value))}
+                  value={Math.min(currentTime, previewDuration)}
+                  onChange={(e) => seekPreviewTime(parseFloat(e.target.value))}
                   className="flex-1 accent-emerald-500 cursor-pointer h-1.5 bg-zinc-800 rounded"
                 />
 
@@ -1975,6 +2673,47 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
 
           {activeTab === 'storyboard' && currentStoryboard && (
             <div className="space-y-3 overflow-y-auto max-h-[500px] pr-1">
+              {activeStructuredPrompt && (
+                <div
+                  data-testid="storyboard-structured-summary"
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono"
+                >
+                  <div className="rounded border border-emerald-500/30 bg-emerald-950/15 p-2.5">
+                    <span className="text-[10px] font-bold uppercase text-emerald-400 block">
+                      1. Subjekt
+                    </span>
+                    <span className="text-zinc-200 line-clamp-2 mt-0.5 block">
+                      {activeStructuredPrompt.subject.primarySubject}
+                    </span>
+                  </div>
+                  <div className="rounded border border-cyan-500/30 bg-cyan-950/15 p-2.5">
+                    <span className="text-[10px] font-bold uppercase text-cyan-400 block">
+                      2. Styl &amp; Optika
+                    </span>
+                    <span className="text-zinc-200 line-clamp-2 mt-0.5 block">
+                      {VISUAL_STYLE_PALETTES[activeStructuredPrompt.style.visualStyle].label} ·{' '}
+                      {OPTICS_LABELS[activeStructuredPrompt.style.optics].split('(')[0].trim()}
+                    </span>
+                  </div>
+                  <div className="rounded border border-amber-500/30 bg-amber-950/15 p-2.5">
+                    <span className="text-[10px] font-bold uppercase text-amber-400 block">
+                      3. Pohyb kamery
+                    </span>
+                    <span className="text-zinc-200 line-clamp-2 mt-0.5 block">
+                      {CAMERA_MOTION_LABELS[activeStructuredPrompt.camera.primaryMotion].split('(')[0].trim()} ({activeStructuredPrompt.camera.motionIntensity}/10)
+                    </span>
+                  </div>
+                  <div className="rounded border border-purple-500/30 bg-purple-950/15 p-2.5">
+                    <span className="text-[10px] font-bold uppercase text-purple-400 block">
+                      4. Časový vývoj
+                    </span>
+                    <span className="text-zinc-200 line-clamp-2 mt-0.5 block tabular-nums">
+                      {activeStructuredPrompt.temporal.beats.length} fází · {activeStructuredPrompt.totalDurationSec}s @ {activeStructuredPrompt.fps}fps
+                    </span>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
                 <div className="rounded border border-emerald-500/20 bg-emerald-950/15 p-3">
                   <span className="text-[10px] uppercase text-emerald-400 block font-bold">
@@ -2123,8 +2862,17 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                     </div>
 
                     <div className="flex items-center justify-between text-[10px] text-zinc-500 pt-2 border-t border-zinc-800/60 mt-2">
-                      <span className="truncate max-w-[140px]">{asset.meta}</span>
-                      <div className="flex items-center gap-2 shrink-0">
+                      <span className="truncate max-w-[120px]">{asset.meta}</span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          data-testid={`review-asset-btn-${asset.id}`}
+                          onClick={() => setReviewModalAsset(asset)}
+                          className="flex items-center gap-1 rounded bg-cyan-500/15 border border-cyan-500/30 px-2 py-0.5 text-cyan-300 hover:bg-cyan-500/25 whitespace-nowrap transition"
+                        >
+                          <Eye className="h-3 w-3" />
+                          <span>Náhled</span>
+                        </button>
                         {asset.line === 'video' && (
                           <button
                             type="button"
@@ -2152,6 +2900,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           role="dialog"
           aria-modal="true"
           aria-label={modalMode === 'customize' ? 'Přizpůsobit šablonu' : 'Nová šablona videa'}
+          data-testid="template-editor-modal"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 font-mono text-xs"
         >
           <div className="w-full max-w-xl rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
@@ -2165,6 +2914,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
               <button
                 type="button"
                 aria-label="Zavřít editor šablony"
+                data-testid="close-template-modal"
                 onClick={() => setIsTemplateModalOpen(false)}
                 className="text-zinc-400 hover:text-white"
               >
@@ -2327,6 +3077,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           role="dialog"
           aria-modal="true"
           aria-label="Dokoupit kredity OpenGen AI"
+          data-testid="topup-modal"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 font-mono text-xs"
         >
           <div className="w-full max-w-2xl rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
@@ -2348,6 +3099,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
               <button
                 type="button"
                 aria-label="Zavřít okno dobití kreditů"
+                data-testid="close-topup-modal"
                 onClick={() => setIsTopUpModalOpen(false)}
                 className="text-zinc-400 hover:text-white p-1"
               >
@@ -2393,6 +3145,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                 </div>
                 <button
                   type="button"
+                  data-testid="topup-pack-starter"
                   onClick={() => handleTopUpSubmit('starter')}
                   className="mt-4 w-full rounded bg-zinc-800 hover:bg-zinc-700 text-white font-bold py-2 text-xs transition border border-zinc-700"
                 >
@@ -2420,6 +3173,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                 </div>
                 <button
                   type="button"
+                  data-testid="topup-pack-creator"
                   onClick={() => handleTopUpSubmit('creator')}
                   className="mt-4 w-full rounded bg-amber-500 hover:bg-amber-400 text-black font-bold py-2 text-xs transition shadow-md"
                 >
@@ -2444,6 +3198,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
                 </div>
                 <button
                   type="button"
+                  data-testid="topup-pack-studio"
                   onClick={() => handleTopUpSubmit('studio')}
                   className="mt-4 w-full rounded bg-purple-600 hover:bg-purple-500 text-white font-bold py-2 text-xs transition shadow-md"
                 >
@@ -2465,6 +3220,16 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* ASSET REVIEW & QA OVERLAY MODAL */}
+      <AssetReviewModal
+        isOpen={Boolean(reviewModalAsset)}
+        asset={reviewModalAsset}
+        onClose={() => setReviewModalAsset(null)}
+        onPublishAsset={handlePublishReviewedAsset}
+        onLoadIntoEditor={handleLoadAssetIntoEditor}
+        canPublish={canPublish}
+      />
     </div>
   );
 };

@@ -24,6 +24,10 @@ import {
   Download,
   Film,
   ExternalLink,
+  Brain,
+  Wand2,
+  ChevronLeft,
+  PackageCheck,
 } from 'lucide-react';
 import { Message, Agent, Activity as ActivityType, RunTrace, FactoryAsset } from '../types/nexus.ts';
 import { downloadVideoAsset, formatBytes, formatDuration } from '../utils/mediaDownload.ts';
@@ -34,6 +38,9 @@ interface ChatOSProps {
   activities: ActivityType[];
   onAssetsUpdated?: () => Promise<void> | void;
   onOpenVaultAsset?: (assetId: string) => void;
+  onOpenNotebookLM?: () => void;
+  pendingPrompt?: string | null;
+  onClearPendingPrompt?: () => void;
 }
 
 export const ChatOS: React.FC<ChatOSProps> = ({
@@ -42,15 +49,23 @@ export const ChatOS: React.FC<ChatOSProps> = ({
   activities,
   onAssetsUpdated,
   onOpenVaultAsset,
+  onOpenNotebookLM,
+  pendingPrompt,
+  onClearPendingPrompt,
 }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [streamingStatus, setStreamingStatus] = useState<string>('NEO plánuje kroky a provádí nástroje v runtime...');
   const [dryRun, setDryRun] = useState(false);
   const [activeThreadId, setActiveThreadId] = useState('th-main-001');
   const [expandedToolEvents, setExpandedToolEvents] = useState<Record<string, boolean>>({});
+  const [expandedReasoning, setExpandedReasoning] = useState<Record<string, boolean>>({});
+  const [activeCarouselIndex, setActiveCarouselIndex] = useState<Record<string, number>>({});
+  const [isBatchDownloading, setIsBatchDownloading] = useState<Record<string, boolean>>({});
   const [downloadingAssetId, setDownloadingAssetId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const isSendingRef = useRef<boolean>(false);
 
   // Load messages on mount
   useEffect(() => {
@@ -71,14 +86,24 @@ export const ChatOS: React.FC<ChatOSProps> = ({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isLoading]);
+  }, [messages, isLoading, streamingStatus]);
+
+  useEffect(() => {
+    if (pendingPrompt && pendingPrompt.trim() && !isSendingRef.current) {
+      const promptToRun = pendingPrompt.trim();
+      onClearPendingPrompt?.();
+      handleSendMessage(promptToRun);
+    }
+  }, [pendingPrompt]);
 
   const handleSendMessage = async (textToSend?: string) => {
     const text = (textToSend || inputText).trim();
-    if (!text || isLoading) return;
+    if (!text || isSendingRef.current) return;
 
+    isSendingRef.current = true;
     setInputText('');
     setIsLoading(true);
+    setStreamingStatus('NEO analyzuje záměr a aktivuje Video Director...');
 
     // Optimistic user message
     const tempUserMsg: Message = {
@@ -95,7 +120,7 @@ export const ChatOS: React.FC<ChatOSProps> = ({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Accept: 'application/json',
+          Accept: 'text/event-stream, application/json',
         },
         body: JSON.stringify({
           content: text,
@@ -103,7 +128,66 @@ export const ChatOS: React.FC<ChatOSProps> = ({
         }),
       });
 
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+
+      if (res.ok && contentType.includes('text/event-stream') && res.body) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let receivedDone = false;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || '';
+
+          for (const rawEvent of events) {
+            const dataLines = rawEvent
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trim());
+            if (dataLines.length === 0) continue;
+
+            try {
+              const evt = JSON.parse(dataLines.join('\n'));
+              if (evt.type === 'span' && evt.data?.message) {
+                setStreamingStatus(evt.data.message);
+              } else if (evt.type === 'tool_event' && evt.data) {
+                const { status, tool, episode, total } = evt.data;
+                if (tool === 'render_video_mp4') {
+                  if (status === 'running') {
+                    setStreamingStatus(
+                      episode && total
+                        ? `Renderuji MP4 epizodu ${episode}/${total} (FFmpeg gradient + synthwave audio)...`
+                        : 'Renderuji vysoce kvalitní H.264 MP4 video s dynamickým HUD...'
+                    );
+                  } else if (status === 'completed' && episode && total) {
+                    setStreamingStatus(`Epizoda ${episode}/${total} vyrenderována a uložena do trezoru.`);
+                  }
+                } else if (tool && status === 'running') {
+                  setStreamingStatus(`Spouštím nástroj: ${tool}...`);
+                }
+              } else if (evt.type === 'done' && evt.data) {
+                receivedDone = true;
+                setMessages((prev) => [...prev, evt.data]);
+                await onAssetsUpdated?.();
+              } else if (evt.type === 'error') {
+                throw new Error(evt.error || 'Chyba SSE streamu');
+              }
+            } catch (parseErr) {
+              if (parseErr instanceof SyntaxError) continue;
+              throw parseErr;
+            }
+          }
+        }
+
+        if (!receivedDone) {
+          await fetchMessages(activeThreadId);
+        }
+      } else if (res.ok) {
         const assistantMsg = await res.json();
         setMessages((prev) => [...prev, assistantMsg]);
         await onAssetsUpdated?.();
@@ -131,7 +215,19 @@ export const ChatOS: React.FC<ChatOSProps> = ({
       }
     } catch (err: any) {
       console.error('Error sending message:', err);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `msg-err-${Date.now()}`,
+          threadId: activeThreadId,
+          role: 'assistant',
+          content: `Došlo k chybě spojení: ${err?.message || 'Neznámá chyba'}`,
+          createdAt: new Date().toISOString(),
+          confidence: 0,
+        },
+      ]);
     } finally {
+      isSendingRef.current = false;
       setIsLoading(false);
     }
   };
@@ -158,6 +254,10 @@ export const ChatOS: React.FC<ChatOSProps> = ({
 
   const toggleToolEvents = (msgId: string) => {
     setExpandedToolEvents((prev) => ({ ...prev, [msgId]: !prev[msgId] }));
+  };
+
+  const toggleReasoning = (msgId: string) => {
+    setExpandedReasoning((prev) => ({ ...prev, [msgId]: !(prev[msgId] ?? true) }));
   };
 
   const extractVideoAssets = (msg: Message): FactoryAsset[] => {
@@ -190,6 +290,20 @@ export const ChatOS: React.FC<ChatOSProps> = ({
     }
   };
 
+  const handleDownloadAllAssets = async (msgId: string, assetsList: FactoryAsset[]) => {
+    setIsBatchDownloading((prev) => ({ ...prev, [msgId]: true }));
+    try {
+      for (const asset of assetsList) {
+        await downloadVideoAsset(asset);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    } catch (err) {
+      console.error('Batch download failed:', err);
+    } finally {
+      setIsBatchDownloading((prev) => ({ ...prev, [msgId]: false }));
+    }
+  };
+
   return (
     <div className="flex h-[calc(100vh-3.5rem)] w-full overflow-hidden">
       {/* Main Chat Center Panel */}
@@ -207,6 +321,18 @@ export const ChatOS: React.FC<ChatOSProps> = ({
           </div>
 
           <div className="flex items-center gap-3">
+            {onOpenNotebookLM && (
+              <button
+                type="button"
+                data-testid="open-notebooklm-chat"
+                onClick={onOpenNotebookLM}
+                className="flex items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/15 px-3 py-1 font-mono text-[11px] font-semibold text-blue-300 hover:bg-blue-500/25 hover:text-white transition"
+              >
+                <Wand2 className="h-3 w-3 text-blue-400" />
+                <span>Přizpůsobit video (NotebookLM)</span>
+              </button>
+            )}
+
             <label className="flex items-center gap-1.5 font-mono text-[11px] text-zinc-400 cursor-pointer">
               <input
                 type="checkbox"
@@ -283,13 +409,105 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                           <span>AI REŽIE</span>
                         </span>
                         <span className="text-zinc-300">{msg.videoBrief.platform} ({msg.videoBrief.aspectRatio})</span>
-                        <span className="text-zinc-400">Styl: {msg.videoBrief.visualStyle}</span>
+                        <span className="text-zinc-400">Styl: {msg.videoBrief.notebookStyle || msg.videoBrief.visualStyle}</span>
                         <span className="text-zinc-400">Tón: {msg.videoBrief.tone}</span>
                         <span className="text-zinc-400">{msg.videoBrief.bpm} BPM</span>
                       </div>
                       <span className="rounded bg-zinc-900 border border-zinc-800 px-1.5 py-0.5 text-[10px] text-emerald-400">
                         {msg.videoBrief.engineUsed}
                       </span>
+                    </div>
+                  )}
+
+                  {/* NEO Deep Thinking & Reasoning Trace Accordion */}
+                  {msg.reasoningTrace && (
+                    <div
+                      data-testid="chat-reasoning-trace"
+                      className="mt-3 rounded-lg border border-indigo-500/35 bg-indigo-950/20 overflow-hidden font-mono text-xs"
+                    >
+                      <button
+                        type="button"
+                        data-testid="reasoning-trace-toggle"
+                        aria-expanded={expandedReasoning[msg.id] ?? true}
+                        onClick={() => toggleReasoning(msg.id)}
+                        className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left bg-indigo-950/30 hover:bg-indigo-950/50 transition"
+                      >
+                        <div className="flex items-center gap-2 text-indigo-300 font-bold text-[11px]">
+                          <Brain className="h-3.5 w-3.5 text-indigo-400" />
+                          <span>NEO DEEP THINKING · {msg.reasoningTrace.thinkingTitle}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-[10px] text-indigo-300/80">
+                          <span className="rounded bg-indigo-500/15 border border-indigo-500/30 px-1.5 py-0.5 tabular-nums">
+                            {msg.reasoningTrace.durationMs} ms
+                          </span>
+                          {(expandedReasoning[msg.id] ?? true) ? (
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          )}
+                        </div>
+                      </button>
+
+                      {(expandedReasoning[msg.id] ?? true) && (
+                        <div className="p-3 space-y-3 text-[11px] border-t border-indigo-500/20">
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                            <div className="rounded border border-zinc-800/90 bg-zinc-950/70 p-2">
+                              <div className="text-[10px] text-indigo-400 uppercase mb-0.5">Algoritmus</div>
+                              <div className="text-zinc-300 leading-snug">{msg.reasoningTrace.algorithmicStrategy}</div>
+                            </div>
+                            <div className="rounded border border-zinc-800/90 bg-zinc-950/70 p-2">
+                              <div className="text-[10px] text-cyan-400 uppercase mb-0.5">Retenční model</div>
+                              <div className="text-zinc-300 leading-snug">{msg.reasoningTrace.retentionModel}</div>
+                            </div>
+                            <div className="rounded border border-zinc-800/90 bg-zinc-950/70 p-2">
+                              <div className="text-[10px] text-emerald-400 uppercase mb-0.5">Audio & BPM</div>
+                              <div className="text-zinc-300 leading-snug">{msg.reasoningTrace.audioPacing}</div>
+                            </div>
+                          </div>
+
+                          {msg.reasoningTrace.agentConsensus?.length > 0 && (
+                            <div className="space-y-1">
+                              <div className="text-[10px] uppercase text-zinc-500">Konsenzus agentů:</div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                                {msg.reasoningTrace.agentConsensus.map((c, cIdx) => (
+                                  <div
+                                    key={cIdx}
+                                    className="rounded border border-zinc-800/80 bg-zinc-900/50 px-2.5 py-1.5 text-[11px]"
+                                  >
+                                    <span className="text-emerald-400 font-bold">@{c.agent}:</span>{' '}
+                                    <span className="text-zinc-300">{c.perspective}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {msg.reasoningTrace.structuredPillars?.length > 0 && (
+                            <div className="space-y-1">
+                              <div className="text-[10px] uppercase text-zinc-500">
+                                Rozložené režijní pilíře ({msg.reasoningTrace.structuredPillars.length} dílů):
+                              </div>
+                              <div className="grid grid-cols-1 gap-1.5">
+                                {msg.reasoningTrace.structuredPillars.map((pillar, pIdx) => (
+                                  <div
+                                    key={pIdx}
+                                    className="rounded border border-zinc-800/80 bg-zinc-950/80 px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-2"
+                                  >
+                                    <div>
+                                      <span className="text-indigo-300 font-bold">#{pIdx + 1} {pillar.title}</span>
+                                      <span className="text-zinc-500"> · {pillar.subject}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5 text-[10px] text-zinc-400">
+                                      <span className="rounded bg-zinc-900 px-1.5 py-0.5">{pillar.style}</span>
+                                      <span className="rounded bg-zinc-900 px-1.5 py-0.5 text-amber-300">{pillar.hookPacing}</span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -370,10 +588,228 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                     </div>
                   )}
 
-                  {/* Inline Video Asset Cards */}
+                  {/* Interactive Video Production Suite Carousel (Batch) OR Single Video Card */}
                   {(() => {
                     const videoAssets = extractVideoAssets(msg);
                     if (videoAssets.length === 0) return null;
+
+                    if (videoAssets.length > 1) {
+                      const activeIdx = Math.min(activeCarouselIndex[msg.id] ?? 0, videoAssets.length - 1);
+                      const activeAsset = videoAssets[activeIdx];
+                      const activeSrc = activeAsset.streamUrl || `/api/v1/assets/${activeAsset.id}/stream`;
+                      const suite = msg.videoBatchSuite;
+
+                      return (
+                        <div className="mt-4 space-y-3" data-testid="chat-video-assets">
+                          {/* Suite Header Banner */}
+                          <div
+                            data-testid="video-batch-suite-banner"
+                            className="rounded-lg border border-emerald-500/40 bg-gradient-to-r from-emerald-950/40 via-zinc-950 to-cyan-950/30 p-3 font-mono text-xs space-y-2"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex items-center gap-2">
+                                <PackageCheck className="h-4 w-4 text-emerald-400" />
+                                <span className="font-bold text-white text-xs">
+                                  {suite?.suiteTitle || `Produkční série (${videoAssets.length}× MP4)`}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="rounded bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-300">
+                                  {videoAssets.length} videí · {suite?.totalDurationSec || videoAssets.reduce((s, a) => s + (a.durationSec || 8), 0)}s celkem
+                                </span>
+                                <button
+                                  type="button"
+                                  data-testid="chat-batch-download-all"
+                                  disabled={Boolean(isBatchDownloading[msg.id])}
+                                  onClick={() => handleDownloadAllAssets(msg.id, videoAssets)}
+                                  className="flex items-center gap-1 rounded bg-emerald-500 px-2.5 py-1 text-[11px] font-bold text-black hover:bg-emerald-400 disabled:opacity-50 transition"
+                                >
+                                  <Download className="h-3 w-3" />
+                                  <span>
+                                    {isBatchDownloading[msg.id]
+                                      ? 'Stahuji sérii...'
+                                      : `Stáhnout vše (${videoAssets.length}× MP4)`}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+                            {suite?.strategySummary && (
+                              <p className="text-[11px] text-zinc-400 leading-snug">{suite.strategySummary}</p>
+                            )}
+                          </div>
+
+                          {/* Episode Switcher Tabs */}
+                          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                            <button
+                              type="button"
+                              aria-label="Předchozí epizoda"
+                              onClick={() =>
+                                setActiveCarouselIndex((prev) => ({
+                                  ...prev,
+                                  [msg.id]: (activeIdx - 1 + videoAssets.length) % videoAssets.length,
+                                }))
+                              }
+                              className="rounded border border-zinc-800 bg-zinc-900 p-1.5 text-zinc-400 hover:text-white shrink-0"
+                            >
+                              <ChevronLeft className="h-3.5 w-3.5" />
+                            </button>
+
+                            {videoAssets.map((ep, idx) => (
+                              <button
+                                key={ep.id}
+                                type="button"
+                                data-testid={`chat-episode-tab-${idx + 1}`}
+                                onClick={() =>
+                                  setActiveCarouselIndex((prev) => ({ ...prev, [msg.id]: idx }))
+                                }
+                                className={`rounded-lg px-2.5 py-1.5 font-mono text-[11px] whitespace-nowrap shrink-0 border transition ${
+                                  idx === activeIdx
+                                    ? 'border-emerald-400 bg-emerald-500/20 text-white font-bold'
+                                    : 'border-zinc-800 bg-zinc-900/70 text-zinc-400 hover:text-white'
+                                }`}
+                              >
+                                Díl {idx + 1} · {ep.videoBrief?.visualStyle?.split('_')[0] || 'HD'}
+                              </button>
+                            ))}
+
+                            <button
+                              type="button"
+                              aria-label="Další epizoda"
+                              onClick={() =>
+                                setActiveCarouselIndex((prev) => ({
+                                  ...prev,
+                                  [msg.id]: (activeIdx + 1) % videoAssets.length,
+                                }))
+                              }
+                              className="rounded border border-zinc-800 bg-zinc-900 p-1.5 text-zinc-400 hover:text-white shrink-0"
+                            >
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+
+                          {/* Active Episode Stage Player */}
+                          <div className="rounded-xl border border-emerald-500/35 bg-zinc-950/95 overflow-hidden">
+                            <div className="flex flex-col sm:flex-row">
+                              <div className="sm:w-56 bg-black flex items-center justify-center border-b sm:border-b-0 sm:border-r border-zinc-800 shrink-0">
+                                <video
+                                  key={activeAsset.id}
+                                  controls
+                                  playsInline
+                                  preload="metadata"
+                                  poster={activeAsset.posterUrl}
+                                  src={activeSrc}
+                                  aria-label={`Přehrávač dílu ${activeIdx + 1}: ${activeAsset.title}`}
+                                  className="w-full max-h-72 object-contain bg-black"
+                                />
+                              </div>
+                              <div className="flex-1 p-3.5 flex flex-col justify-between gap-2.5 font-mono text-xs">
+                                <div>
+                                  <div className="flex items-center justify-between gap-2 text-[10px] text-emerald-400 uppercase font-bold">
+                                    <span className="flex items-center gap-1">
+                                      <Film className="h-3 w-3" />
+                                      <span>DÍL {activeIdx + 1} Z {videoAssets.length} · RENDERED MP4</span>
+                                    </span>
+                                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 border border-emerald-500/30">
+                                      {activeAsset.videoBrief?.visualStyle || activeAsset.status || 'ready'}
+                                    </span>
+                                  </div>
+                                  <h4 className="font-sans text-sm font-bold text-white mt-1.5">
+                                    {activeAsset.title}
+                                  </h4>
+                                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-400 tabular-nums">
+                                    <span>{formatDuration(activeAsset.durationSec || 8)}</span>
+                                    <span>{activeAsset.resolution || '720x1280'}</span>
+                                    <span>{formatBytes(activeAsset.sizeBytes)}</span>
+                                    <span className="text-zinc-500">{activeAsset.id}</span>
+                                  </div>
+                                  {activeAsset.videoStoryboard?.scenes && (
+                                    <div className="mt-2.5 space-y-1">
+                                      <div className="text-[10px] uppercase text-zinc-500">Scénář dílu:</div>
+                                      <div className="flex flex-wrap gap-1">
+                                        {activeAsset.videoStoryboard.scenes.map((sc) => (
+                                          <span
+                                            key={sc.id}
+                                            className="rounded border border-zinc-800 bg-zinc-900/70 px-1.5 py-0.5 text-[10px] text-zinc-300"
+                                          >
+                                            {sc.timeRange} {sc.kineticText}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-zinc-800/80">
+                                  <button
+                                    type="button"
+                                    data-testid={`chat-download-${activeAsset.id}`}
+                                    disabled={downloadingAssetId === activeAsset.id}
+                                    onClick={() => handleDownloadAsset(activeAsset)}
+                                    className="flex items-center gap-1.5 rounded bg-emerald-500 px-3 py-1.5 font-bold text-black hover:bg-emerald-400 disabled:opacity-50 transition"
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                    <span>
+                                      {downloadingAssetId === activeAsset.id ? 'Stahuji...' : 'Stáhnout MP4'}
+                                    </span>
+                                  </button>
+
+                                  {onOpenVaultAsset && (
+                                    <button
+                                      type="button"
+                                      data-testid={`chat-open-vault-${activeAsset.id}`}
+                                      onClick={() => onOpenVaultAsset(activeAsset.id)}
+                                      className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-200 hover:text-white hover:border-emerald-500/50 transition"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5 text-cyan-400" />
+                                      <span>Otevřít v trezoru</span>
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Thumbnail Episode Cards Grid */}
+                          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                            {videoAssets.map((ep, idx) => (
+                              <button
+                                key={ep.id}
+                                type="button"
+                                data-testid="chat-video-card"
+                                data-asset-id={ep.id}
+                                onClick={() =>
+                                  setActiveCarouselIndex((prev) => ({ ...prev, [msg.id]: idx }))
+                                }
+                                className={`text-left rounded-lg border p-2 transition flex flex-col gap-1.5 ${
+                                  idx === activeIdx
+                                    ? 'border-emerald-400 bg-emerald-950/30'
+                                    : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700'
+                                }`}
+                              >
+                                {ep.posterUrl ? (
+                                  <img
+                                    src={ep.posterUrl}
+                                    alt={ep.title}
+                                    className="w-full h-20 object-cover rounded border border-zinc-800 bg-black"
+                                  />
+                                ) : (
+                                  <div className="w-full h-20 rounded bg-zinc-950 border border-zinc-800 flex items-center justify-center">
+                                    <Film className="h-5 w-5 text-emerald-400" />
+                                  </div>
+                                )}
+                                <div className="font-mono text-[10px] font-bold text-emerald-400">
+                                  DÍL #{idx + 1} · {formatDuration(ep.durationSec || 8)}
+                                </div>
+                                <div className="text-[11px] font-medium text-zinc-200 line-clamp-2 leading-tight">
+                                  {ep.title}
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    }
+
                     return (
                       <div className="mt-4 space-y-3" data-testid="chat-video-assets">
                         {videoAssets.map((asset) => {
@@ -391,6 +827,7 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                                     controls
                                     playsInline
                                     preload="metadata"
+                                    poster={asset.posterUrl}
                                     src={streamSrc}
                                     aria-label={`Náhled videa ${asset.title}`}
                                     className="w-full max-h-56 object-contain bg-black"
@@ -589,11 +1026,14 @@ export const ChatOS: React.FC<ChatOSProps> = ({
             );
           })}
 
-          {/* Loading indicator */}
+          {/* Live SSE Loading / Thinking indicator */}
           {isLoading && (
-            <div className="flex items-center gap-2 font-mono text-xs text-zinc-400 bg-zinc-900/40 border border-zinc-800/60 rounded p-3 max-w-md">
-              <RefreshCw className="h-3.5 w-3.5 animate-spin text-emerald-400" />
-              <span>NEO plánuje kroky a provádí nástroje v runtime...</span>
+            <div
+              data-testid="chat-streaming-status"
+              className="flex items-center gap-2.5 font-mono text-xs text-emerald-300 bg-emerald-950/20 border border-emerald-500/30 rounded-lg p-3 max-w-xl"
+            >
+              <RefreshCw className="h-3.5 w-3.5 animate-spin text-emerald-400 shrink-0" />
+              <span>{streamingStatus}</span>
             </div>
           )}
 
@@ -608,22 +1048,39 @@ export const ChatOS: React.FC<ChatOSProps> = ({
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Zadejte byznys cíl (např. 'Chci vydělat 50 000 Kč měsíčně', 'Vytvoř 5 videí na TikTok', 'Spusť AI boardroom')..."
+              placeholder="Zadejte byznys cíl (např. 'Chci vydělat 50 000 Kč měsíčně', 'Vytvoř mi 5 tik tok videí', 'Spusť AI boardroom')..."
               rows={2}
-              className="w-full resize-none bg-transparent p-3 pr-24 text-xs sm:text-sm text-white placeholder-zinc-500 focus:outline-none"
+              className="w-full resize-none bg-transparent p-3 pr-24 pb-9 text-xs sm:text-sm text-white placeholder-zinc-500 focus:outline-none"
             />
-            <div className="absolute bottom-2.5 right-2.5 flex items-center gap-2">
-              <span className="hidden font-mono text-[10px] text-zinc-500 sm:inline">
-                Enter = Odeslat
-              </span>
-              <button
-                data-testid="chat-send"
-                onClick={() => handleSendMessage()}
-                disabled={isLoading || !inputText.trim()}
-                className="flex h-7 w-7 items-center justify-center rounded bg-emerald-500 text-black hover:bg-emerald-400 disabled:opacity-40 transition"
-              >
-                <Send className="h-3.5 w-3.5 fill-current" />
-              </button>
+            <div className="absolute bottom-2.5 left-3 right-2.5 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                {onOpenNotebookLM && (
+                  <button
+                    type="button"
+                    data-testid="open-notebooklm-composer"
+                    onClick={onOpenNotebookLM}
+                    className="flex items-center gap-1 rounded border border-blue-500/35 bg-blue-500/10 px-2 py-0.5 font-mono text-[10px] text-blue-300 hover:bg-blue-500/20 hover:text-white transition"
+                  >
+                    <Sparkles className="h-3 w-3 text-blue-400" />
+                    <span>NotebookLM Studio</span>
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="hidden font-mono text-[10px] text-zinc-500 sm:inline">
+                  Enter = Odeslat
+                </span>
+                <button
+                  type="button"
+                  data-testid="chat-send"
+                  aria-label="Odeslat zprávu"
+                  onClick={() => handleSendMessage()}
+                  disabled={isLoading || !inputText.trim()}
+                  className="flex h-7 w-7 items-center justify-center rounded bg-emerald-500 text-black hover:bg-emerald-400 disabled:opacity-40 transition"
+                >
+                  <Send className="h-3.5 w-3.5 fill-current" />
+                </button>
+              </div>
             </div>
           </div>
         </div>

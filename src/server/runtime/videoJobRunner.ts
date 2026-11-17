@@ -7,6 +7,7 @@ import {
   FactoryAsset,
   MediaRenderStage,
   SmartTrendAnalysisResult,
+  StructuredVideoPrompt,
   UserVideoTemplate,
   VideoCreativeBrief,
   VideoStoryboard,
@@ -26,6 +27,7 @@ export interface QueuedVideoRenderInput {
   template?: UserVideoTemplate;
   topic: string;
   dryRun?: boolean;
+  onJobFailed?: (err: Error) => void;
 }
 
 /**
@@ -80,6 +82,7 @@ export async function executeVideoRenderJob(input: QueuedVideoRenderInput): Prom
       storyboard,
       template,
       brief,
+      structuredPrompt: asset.structuredPrompt || brief.structuredPrompt || storyboard.structuredPrompt,
       dryRun: Boolean(dryRun),
       onStageProgress: (stage, pct, msg) => updateAssetProgress(asset, stage, pct, msg),
     });
@@ -137,6 +140,11 @@ export async function executeVideoRenderJob(input: QueuedVideoRenderInput): Prom
     asset.progressStage = 'failed';
     asset.workerMessage = `Chyba workeru: ${err.message}`;
     asset.updatedAt = new Date().toISOString();
+    try {
+      input.onJobFailed?.(err instanceof Error ? err : new Error(String(err)));
+    } catch {
+      // Never mask original render error if refund hook fails
+    }
     throw err;
   } finally {
     db.activeJobQueueCount = Math.max(0, db.activeJobQueueCount - 1);
@@ -236,9 +244,12 @@ export function createPendingVideoAsset(params: {
   storyboard: VideoStoryboard;
   moviePyScript: string;
   template?: UserVideoTemplate;
+  structuredPrompt?: StructuredVideoPrompt;
   dryRun?: boolean;
 }): FactoryAsset {
   const now = new Date().toISOString();
+  const resolvedStructuredPrompt =
+    params.structuredPrompt || params.brief.structuredPrompt || params.storyboard.structuredPrompt;
   return {
     id: params.assetId,
     threadId: params.threadId,
@@ -268,6 +279,7 @@ export function createPendingVideoAsset(params: {
     moviePyScript: params.moviePyScript,
     videoStoryboard: params.storyboard,
     videoBrief: params.brief,
+    structuredPrompt: resolvedStructuredPrompt,
     dryRun: Boolean(params.dryRun),
     createdAt: now,
     updatedAt: now,

@@ -30,6 +30,9 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ trace, isOpen, onClose
           <h3 className="text-sm font-semibold text-white mt-1">Auditní Trace & Spany Běhu</h3>
         </div>
         <button
+          type="button"
+          aria-label="Zavřít"
+          data-testid="close-trace-drawer"
           onClick={onClose}
           className="rounded p-1 text-zinc-400 hover:bg-zinc-900 hover:text-white"
         >

@@ -148,10 +148,14 @@ export class ToolExecutor {
     let lastError: any = null;
 
     while (attempt <= this.MAX_RETRIES) {
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       try {
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`Timeout vypršel (${this.TOOL_TIMEOUT_MS} ms)`)), this.TOOL_TIMEOUT_MS)
-        );
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error(`Timeout vypršel (${this.TOOL_TIMEOUT_MS} ms)`)),
+            this.TOOL_TIMEOUT_MS
+          );
+        });
 
         const executionPromise = tool.execute(validatedArgs, { dryRun: options.dryRun });
         const result = await Promise.race([executionPromise, timeoutPromise]);
@@ -187,6 +191,8 @@ export class ToolExecutor {
         // Exponential backoff with jitter: 200ms * 2^attempt + jitter
         const backoffMs = Math.min(200 * Math.pow(2, attempt) + Math.random() * 100, 2000);
         await new Promise((res) => setTimeout(res, backoffMs));
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
       }
     }
 

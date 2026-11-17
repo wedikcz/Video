@@ -8,6 +8,10 @@ import { db } from '../db.ts';
 import { MediaRenderer } from './mediaRenderer.ts';
 import { MoviePyCompiler } from './moviepy.ts';
 import { VideoDirectorEngine } from './videoDirector.ts';
+import {
+  analyzeCommentWithMultiCore,
+  pickBestReplyStrategy,
+} from './commentIntelligence.ts';
 import { FactoryAsset, VideoCreativeBrief } from '../../types/nexus.ts';
 
 export interface ToolDefinition {
@@ -296,6 +300,10 @@ toolsRegistry.set('create_factory_asset', {
           filePath: rendered.filePath,
           streamUrl: rendered.streamUrl,
           downloadUrl: rendered.downloadUrl,
+          posterUrl: `/api/v1/assets/${assetId}/stream?format=poster`,
+          faststartVerified: rendered.faststartVerified,
+          progressPercent: 100,
+          progressStage: 'ready',
           moviePyScript,
           videoStoryboard: storyboard,
           videoBrief: resolvedBrief,
@@ -604,3 +612,103 @@ toolsRegistry.set('log_activity', {
     };
   },
 });
+
+// 13. analyze_social_comments
+toolsRegistry.set('analyze_social_comments', {
+  name: 'analyze_social_comments',
+  description: 'Spustí 5jádrovou AI analýzu komentářů z YouTube, TikTok a Instagram Reels včetně detekce hot leadů a Troll-Shield obrany.',
+  parameters: z.object({
+    platform: z.enum(['all', 'YouTube', 'TikTok', 'Instagram Reels']).default('all'),
+  }),
+  sideEffect: false,
+  requiredPermissions: ['read:business'],
+  execute: async ({ platform = 'all' }) => {
+    const filtered =
+      platform === 'all'
+        ? db.comments
+        : db.comments.filter((c) => c.platform === platform);
+    const kpis = db.getCommentSwarmKpis();
+    return {
+      platform,
+      totalAnalyzed: filtered.length,
+      kpis,
+      topLeads: filtered
+        .filter((c) => c.multiCoreAnalysis.conversionCore.leadDetected)
+        .slice(0, 4)
+        .map((c) => ({
+          id: c.id,
+          authorHandle: c.authorHandle,
+          platform: c.platform,
+          intent: c.multiCoreAnalysis.intentCore.intent,
+          estimatedValueCzk: c.multiCoreAnalysis.conversionCore.estimatedValueCzk || 0,
+        })),
+    };
+  },
+});
+
+// 14. autopilot_comment_swarm
+toolsRegistry.set('autopilot_comment_swarm', {
+  name: 'autopilot_comment_swarm',
+  description: 'Autonomně zpracuje frontu čekajících komentářů napříč 5 jádry (odpovědi, Troll-Shield karanténa a CRM lead sync). Má vedlejší efekt.',
+  parameters: z.object({
+    strategy: z.enum(['hormozi_hook', 'sales_funnel', 'authority_guide', 'witty_shield']).default('hormozi_hook'),
+    syncLeads: z.boolean().default(true),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:activity'],
+  execute: async ({ strategy = 'hormozi_hook', syncLeads = true }, context) => {
+    const pending = db.comments.filter((c) => c.status === 'pending' || c.status === 'ai_drafted');
+    if (context?.dryRun) {
+      return {
+        dryRun: true,
+        pendingCount: pending.length,
+        strategy,
+        message: `[Simulace] Swarm Autopilot by zpracoval ${pending.length} komentářů strategií ${strategy}.`,
+      };
+    }
+
+    let replied = 0;
+    let quarantined = 0;
+    let leadsSynced = 0;
+
+    for (const c of pending) {
+      c.multiCoreAnalysis = await analyzeCommentWithMultiCore(c, db.commentAutopilotConfig);
+      if (c.multiCoreAnalysis.shieldCore.action === 'quarantine') {
+        c.status = 'shield_blocked';
+        quarantined += 1;
+        continue;
+      }
+      const picked = pickBestReplyStrategy(c.multiCoreAnalysis, strategy);
+      if (picked) {
+        c.selectedReply = picked.replyText;
+        c.repliedByStrategy = picked.strategy;
+        c.repliedAt = new Date().toISOString();
+        c.status = 'auto_replied';
+        replied += 1;
+      }
+      if (syncLeads && c.multiCoreAnalysis.conversionCore.leadDetected) {
+        db.syncCommentLeadToCrm(c.id);
+        leadsSynced += 1;
+      }
+    }
+
+    db.activities.unshift({
+      id: `act-${Date.now()}-swarm`,
+      title: `Swarm Autopilot vyřídil ${replied} komentářů`,
+      description: `5jádrový swarm izoloval ${quarantined} hrozeb a synchronizoval ${leadsSynced} hot leadů do CRM.`,
+      agent: 'CMO Agent',
+      timestamp: new Date().toISOString(),
+      type: 'action',
+    });
+
+    return {
+      success: true,
+      processed: pending.length,
+      replied,
+      quarantined,
+      leadsSynced,
+      kpis: db.getCommentSwarmKpis(),
+    };
+  },
+});
+

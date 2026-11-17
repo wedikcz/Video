@@ -8,7 +8,19 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { MediaRenderStage, UserVideoTemplate, VideoCreativeBrief, VideoStoryboard } from '../../types/nexus.ts';
+import {
+  MediaRenderStage,
+  StructuredVideoPrompt,
+  UserVideoTemplate,
+  VideoCreativeBrief,
+  VideoStoryboard,
+} from '../../types/nexus.ts';
+import {
+  CAMERA_MOTION_LABELS,
+  LIGHTING_LABELS,
+  OPTICS_LABELS,
+  TRANSITION_LABELS,
+} from '../../utils/structuredVideoPrompt.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -228,6 +240,55 @@ function wrapTextLines(text: string, maxChars: number): string[] {
   return lines.slice(0, 3);
 }
 
+export interface GradientColorSet {
+  c0: string;
+  c1: string;
+  c2: string;
+  c3: string;
+  hex: string;
+  sec: string;
+}
+
+export function resolveGradientPalette(style?: string, fallbackHex = '#10b981', fallbackSec = '#38bdf8'): GradientColorSet {
+  const s = (style || '').toLowerCase();
+  if (s.includes('cyberpunk') || s.includes('neon') || s.includes('kyber')) {
+    return { c0: '0x0d0221', c1: '0x260c38', c2: '0x051622', c3: '0x1b003a', hex: '0x06b6d4', sec: '0xec4899' };
+  }
+  if (s.includes('fintech') || s.includes('emerald') || s.includes('smaragd')) {
+    return { c0: '0x041325', c1: '0x092635', c2: '0x051c24', c3: '0x0e3a43', hex: '0x10b981', sec: '0x34d399' };
+  }
+  if (s.includes('gold') || s.includes('zlat') || s.includes('luxury') || s.includes('luxus')) {
+    return { c0: '0x1a120b', c1: '0x2b1e11', c2: '0x140d07', c3: '0x382813', hex: '0xf59e0b', sec: '0xfde047' };
+  }
+  if (s.includes('anime') || s.includes('manga')) {
+    return { c0: '0x1e1035', c1: '0x3b0764', c2: '0x4c0519', c3: '0x172554', hex: '0xf472b6', sec: '0x818cf8' };
+  }
+  if (s.includes('retro') || s.includes('synth')) {
+    return { c0: '0x180b2c', c1: '0x2e0854', c2: '0x0c1b33', c3: '0x43123b', hex: '0xec4899', sec: '0x06b6d4' };
+  }
+  if (s.includes('kawaii') || s.includes('pink') || s.includes('pastel')) {
+    return { c0: '0x2e1065', c1: '0x4a044e', c2: '0x701a75', c3: '0x1e1b4b', hex: '0xf472b6', sec: '0x38bdf8' };
+  }
+  if (s.includes('tabule') || s.includes('board') || s.includes('blueprint') || s.includes('klasick') || s.includes('classic')) {
+    return { c0: '0x0a192f', c1: '0x0c2744', c2: '0x081e36', c3: '0x041122', hex: '0x38bdf8', sec: '0x60a5fa' };
+  }
+  if (s.includes('starod') || s.includes('ancient') || s.includes('pergam')) {
+    return { c0: '0x1f140e', c1: '0x2e1c12', c2: '0x160d09', c3: '0x3a2417', hex: '0xd97706', sec: '0xfef3c7' };
+  }
+  if (s.includes('vystrihov') || s.includes('cutout') || s.includes('paper')) {
+    return { c0: '0x1c140d', c1: '0x3b2414', c2: '0x160f0a', c3: '0x4a2c16', hex: '0xf59e0b', sec: '0xfbbf24' };
+  }
+  if (s.includes('akvarel') || s.includes('watercolor')) {
+    return { c0: '0x061e24', c1: '0x092b33', c2: '0x05171b', c3: '0x0e3a45', hex: '0x2dd4bf', sec: '0x38bdf8' };
+  }
+  if (s.includes('coral') || s.includes('energ')) {
+    return { c0: '0x1f0814', c1: '0x350d24', c2: '0x1a0614', c3: '0x400e28', hex: '0xf43f5e', sec: '0xfb923c' };
+  }
+  const h = fallbackHex.startsWith('#') ? `0x${fallbackHex.slice(1)}` : '0x10b981';
+  const sColor = fallbackSec.startsWith('#') ? `0x${fallbackSec.slice(1)}` : '0x38bdf8';
+  return { c0: '0x0a192f', c1: '0x1e1b4b', c2: '0x311042', c3: '0x0f172a', hex: h, sec: sColor };
+}
+
 /**
  * Generates a real playable H.264/AAC MP4 file on disk atomically (.tmp -> rename)
  * using ffmpeg with `+faststart`, plus a lightweight JPEG poster frame.
@@ -315,12 +376,17 @@ export class MediaRenderer {
     storyboard?: VideoStoryboard;
     template?: UserVideoTemplate;
     brief?: VideoCreativeBrief;
+    structuredPrompt?: StructuredVideoPrompt;
     dryRun?: boolean;
     onStageProgress?: (stage: MediaRenderStage, percent: number, message: string) => void;
   }): Promise<RenderedVideoArtifact> {
+    const sp = params.structuredPrompt || params.brief?.structuredPrompt || params.storyboard?.structuredPrompt;
     const threadId = params.threadId || 'th-main-001';
-    const format = params.brief?.aspectRatio || params.format || params.storyboard?.aspectRatio || '9:16';
-    const durationSec = Math.max(3, Math.min(15, params.brief?.durationSec || params.durationSec || 6));
+    const format = sp?.aspectRatio || params.brief?.aspectRatio || params.format || params.storyboard?.aspectRatio || '9:16';
+    const durationSec = Math.max(
+      3,
+      Math.min(15, sp?.totalDurationSec || params.brief?.durationSec || params.durationSec || 6)
+    );
     const resolution = format === '16:9' ? '1280x720' : '720x1280';
     const [width, height] = resolution.split('x').map(Number);
 
@@ -328,58 +394,14 @@ export class MediaRenderer {
     const posterPath = this.getPosterFilePath(threadId, params.assetId);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
-    // In DRY-RUN, copy/reuse verified reference video atomically if present, or render reference clip once
-    if (params.dryRun) {
-      params.onStageProgress?.('rendering_ffmpeg', 45, 'Příprava referenčního H.264/AAC MP4 proudu...');
-      const refPath = this.getAssetFilePath('th-main-001', 'asset-001');
-      if (!fs.existsSync(refPath) || fs.statSync(refPath).size <= 1024) {
-        await this.renderFfmpegClip({
-          outputPath: refPath,
-          posterPath: this.getPosterFilePath('th-main-001', 'asset-001'),
-          width,
-          height,
-          durationSec,
-          title: params.title,
-          hook: params.brief?.hook || params.storyboard?.hook || params.prompt || 'NEXUS X OS Referenční Video Asset',
-          cta: params.brief?.cta || params.storyboard?.cta || 'Stáhněte si kompletní workflow v Media Vaultu.',
-          highlightColor: params.brief?.accentColor || params.template?.subtitleStyle?.highlightColor || '#10b981',
-          secondaryColor: params.brief?.secondaryColor || '#38bdf8',
-          bgHex: params.brief?.bgHex || '0x0a0f18',
-          platformLabel: params.brief?.platform || params.storyboard?.targetPlatform || 'AI VIDEO STUDIO',
-          bpm: params.brief?.bpm || params.template?.musicPreset?.bpm || 128,
-          scenes: params.brief?.scenes,
-          onStageProgress: params.onStageProgress,
-        });
-      }
-      if (filePath !== refPath) {
-        const tmpFile = `${filePath}.${process.pid}.${Date.now()}.tmp.mp4`;
-        fs.copyFileSync(refPath, tmpFile);
-        fs.renameSync(tmpFile, filePath);
-      }
-      params.onStageProgress?.('optimizing_faststart', 80, 'Ověřuji MP4 atomy (-movflags +faststart)...');
-      const faststart = await this.ensureFaststartMp4(filePath);
-      params.onStageProgress?.('verifying_integrity', 94, 'Extrakce náhledu a výpočet SHA-256 kontrolního součtu...');
-      await this.ensurePosterFile(filePath, posterPath);
-      const { sizeBytes, sha256 } = this.computeFileChecksum(filePath);
-      return {
-        assetId: params.assetId,
-        threadId,
-        filePath,
-        posterPath,
-        sizeBytes,
-        sha256,
-        durationSec,
-        resolution,
-        mimeType: 'video/mp4',
-        streamUrl: `/api/v1/assets/${params.assetId}/stream`,
-        downloadUrl: `/api/v1/assets/${params.assetId}/download`,
-        renderedWithFfmpeg: sizeBytes > 1024,
-        faststartVerified: faststart.faststartVerified,
-        atoms: faststart.atoms,
-      };
-    }
-
-    params.onStageProgress?.('rendering_ffmpeg', 40, 'FFmpeg renderuje H.264/AAC scény a kinetické titulky...');
+    // In both live and dry-run, execute high-speed local procedural render with distinct titles, hooks, gradients & audio
+    params.onStageProgress?.(
+      'rendering_ffmpeg',
+      40,
+      sp
+        ? `Lokální FFmpeg syntéza: ${sp.temporal.beats.length} časových fází (${sp.camera.primaryMotion}, ${sp.style.optics})...`
+        : 'FFmpeg renderuje H.264/AAC scény a kinetické titulky...'
+    );
     const renderedWithFfmpeg = await this.renderFfmpegClip({
       outputPath: filePath,
       posterPath,
@@ -396,12 +418,14 @@ export class MediaRenderer {
         params.brief?.cta ||
         params.storyboard?.cta ||
         'Stáhněte si MP4 nebo publikujte přímo na sociální sítě.',
-      highlightColor: params.brief?.accentColor || params.template?.subtitleStyle?.highlightColor || '#10b981',
-      secondaryColor: params.brief?.secondaryColor || '#38bdf8',
-      bgHex: params.brief?.bgHex || '0x0a0f18',
-      platformLabel: params.brief?.platform || params.storyboard?.targetPlatform || 'VIDEO FACTORY',
+      highlightColor: sp?.style.accentColor || params.brief?.accentColor || params.template?.subtitleStyle?.highlightColor || '#10b981',
+      secondaryColor: sp?.style.secondaryColor || params.brief?.secondaryColor || '#38bdf8',
+      bgHex: sp?.style.bgHex || params.brief?.bgHex || '0x0a0f18',
+      platformLabel: params.brief?.platform || params.storyboard?.targetPlatform || 'LOCAL DIRECTOR',
+      styleTheme: params.brief?.notebookStyle || params.brief?.visualStyle || sp?.style.visualStyle,
       bpm: params.brief?.bpm || params.template?.musicPreset?.bpm || 128,
       scenes: params.brief?.scenes,
+      structuredPrompt: sp,
       onStageProgress: params.onStageProgress,
     });
 
@@ -532,8 +556,10 @@ export class MediaRenderer {
     secondaryColor: string;
     bgHex: string;
     platformLabel: string;
+    styleTheme?: string;
     bpm: number;
     scenes?: VideoCreativeBrief['scenes'];
+    structuredPrompt?: StructuredVideoPrompt;
     onStageProgress?: (stage: MediaRenderStage, percent: number, message: string) => void;
   }): Promise<boolean> {
     const existing = this.inFlightRenders.get(opts.outputPath);
@@ -550,118 +576,221 @@ export class MediaRenderer {
       const fontOpt = hasBoldFont ? `fontfile=${FONT_BOLD}:` : '';
       const monoFontOpt = hasMonoFont ? `fontfile=${FONT_MONO}:` : fontOpt;
 
-      const hexColor = opts.highlightColor.startsWith('#')
-        ? `0x${opts.highlightColor.slice(1)}`
-        : '0x10b981';
-      const secColor = opts.secondaryColor.startsWith('#')
-        ? `0x${opts.secondaryColor.slice(1)}`
-        : '0x38bdf8';
-
-      const sceneList =
-        opts.scenes && opts.scenes.length > 0
-          ? opts.scenes
-          : [
-              {
-                title: opts.title,
-                subtitle: opts.hook,
-                visualCue: '3s Hook + Dynamický rám',
-                durationSec: Math.max(2, Math.round(opts.durationSec * 0.35)),
-                kineticTag: 'SCÉNA 1/3 · HOOK',
-              },
-              {
-                title: 'KLÍČOVÉ ŘEŠENÍ V PRAXI',
-                subtitle: opts.hook,
-                visualCue: 'Vizuální důkaz & postup',
-                durationSec: Math.max(2, Math.round(opts.durationSec * 0.35)),
-                kineticTag: 'SCÉNA 2/3 · DEMO',
-              },
-              {
-                title: 'DALŠÍ KROK & VÝSLEDEK',
-                subtitle: opts.cta,
-                visualCue: 'Výzva k akci + plynulá smyčka',
-                durationSec: Math.max(2, Math.round(opts.durationSec * 0.3)),
-                kineticTag: 'SCÉNA 3/3 · CTA',
-              },
-            ];
+      const sp = opts.structuredPrompt;
+      const palette = resolveGradientPalette(
+        opts.styleTheme || sp?.style.visualStyle || opts.platformLabel,
+        opts.highlightColor,
+        opts.secondaryColor
+      );
+      const hexColor = palette.hex;
+      const secColor = palette.sec;
 
       const isWide = opts.width > opts.height;
+      const shortEdge = Math.min(opts.width, opts.height);
+      const renderFps = sp?.fps === 24 || sp?.fps === 60 ? Math.min(30, sp.fps) : 24;
+      const ctaPillText = escapeDrawtext(
+        (opts.cta && opts.cta.length <= 36 ? opts.cta : 'SLEDUJ PROFIL PRO DALŠÍ DÍL SÉRIE').toUpperCase()
+      );
+
       const filters: string[] = [
-        // Top dual-tone accent bar & animated kinetic scanner beam
-        `drawbox=x=0:y=0:w=iw:h=10:color=${hexColor}@0.95:t=fill`,
-        `drawbox=x=0:y=10:w='iw*(0.25+0.75*abs(sin(t*1.4)))':h=4:color=${secColor}@0.85:t=fill`,
-        `drawbox=x=32:y=32:w=iw-64:h=ih-64:color=${hexColor}@0.35:t=2`,
-        // Subtle animated atmospheric band behind main headline
-        `drawbox=x=44:y=ih*0.21:w=iw-88:h=ih*0.44:color=0x111827@0.55:t=fill`,
-        // Animated bottom progress bar synced to clip duration
-        `drawbox=x=48:y=ih-68:w=iw-96:h=10:color=0x18181b@0.95:t=fill`,
-        `drawbox=x=48:y=ih-68:w='(iw-96)*t/${opts.durationSec}':h=10:color=${hexColor}@0.95:t=fill`,
-        // Persistent studio header
-        `drawtext=${monoFontOpt}text='NEXUS X OS // ${escapeDrawtext(opts.platformLabel.toUpperCase())}':fontcolor=${hexColor}:fontsize=${Math.round(opts.width * 0.03)}:x=56:y=66`,
-        `drawtext=${monoFontOpt}text='${opts.bpm} BPM · AI DIRECTOR':fontcolor=0xa1a1aa:fontsize=${Math.round(opts.width * 0.022)}:x=w-tw-56:y=70`,
+        // 1. Perspective blueprint grid
+        'drawgrid=w=64:h=64:color=white@0.045:t=1',
+        // 2. Cinematic vignette for peripheral focus
+        'vignette=PI/4',
+        // 3. Top TikTok / Studio live creator bar (widened so YOUTUBE SHORTS fits untruncated)
+        'drawbox=x=36:y=32:w=352:h=40:color=0x000000@0.68:t=fill',
+        'drawbox=x=36:y=32:w=352:h=40:color=white@0.18:t=1',
+        // Red live REC indicator
+        'drawbox=x=50:y=46:w=12:h=12:color=0xef4444:t=fill',
+        `drawtext=${monoFontOpt}text='@NEXUS · ${escapeDrawtext(opts.platformLabel.toUpperCase().slice(0, 18))}':fontcolor=0xffffff:fontsize=${Math.round(shortEdge * 0.022)}:x=72:y=44`,
+        `drawtext=${monoFontOpt}text='REC 4K // ${opts.bpm} BPM':fontcolor=${secColor}:fontsize=${Math.round(shortEdge * 0.021)}:x=w-tw-42:y=44`,
+        // 4. Central frosted glass card with glowing neon border
+        `drawbox=x=36:y=ih*0.19:w=iw-72:h=ih*0.52:color=0x030712@0.78:t=fill`,
+        `drawbox=x=36:y=ih*0.19:w=iw-72:h=ih*0.52:color=${hexColor}@0.45:t=2`,
+        // Top accent line on card
+        `drawbox=x=36:y=ih*0.19:w=iw-72:h=4:color=${hexColor}@0.95:t=fill`,
+        // 5. Animated bottom progress bar synced to duration
+        'drawbox=x=44:y=ih-46:w=iw-88:h=8:color=0x18181b@0.95:t=fill',
+        `drawbox=x=44:y=ih-46:w='(iw-88)*t/${opts.durationSec}':h=8:color=${hexColor}@0.95:t=fill`,
+        // 6. Bottom Safe-Zone CTA pill (Hormozi style)
+        `drawbox=x=44:y=ih-104:w=iw-88:h=44:color=${hexColor}@0.95:t=fill`,
+        `drawtext=${fontOpt}text='${ctaPillText}':fontcolor=0x000000:fontsize=${Math.round(shortEdge * 0.025)}:x=(w-text_w)/2:y=h-91`,
+        // 7. Card bottom-right style badge aligned cleanly above equalizer baseline
+        `drawtext=${monoFontOpt}text='${escapeDrawtext((opts.styleTheme || sp?.style.visualStyle || 'STUDIO').toUpperCase().replace(/_/g, ' '))}':fontcolor=0x94a3b8:fontsize=${Math.round(shortEdge * 0.019)}:x=w-tw-54:y=h*0.665`,
       ];
 
-      // 6 animated audio-reactive style equalizer bars above progress bar (comma-free math!)
-      for (let b = 0; b < 6; b++) {
-        const barX = 56 + b * 22;
-        const speed = (2.4 + b * 0.7).toFixed(1);
+      // 12 animated audio-reactive equalizer bars growing cleanly UPWARD from baseline ih*0.680
+      for (let b = 0; b < 12; b++) {
+        const barX = 52 + b * (isWide ? 28 : 18);
+        const speed = (2.2 + b * 0.4).toFixed(1);
+        const barHExpr = `8+24*abs(sin(t*${speed}+${b}))`;
         filters.push(
-          `drawbox=x=${barX}:y=ih-108:w=12:h='8+24*abs(sin(t*${speed}+${b}))':color=${b % 2 === 0 ? hexColor : secColor}@0.85:t=fill`
+          `drawbox=x=${barX}:y='ih*0.680-(${barHExpr})':w=${isWide ? 14 : 10}:h='${barHExpr}':color=${b % 2 === 0 ? hexColor : secColor}@0.88:t=fill`
         );
       }
 
-      // Compute normalized time windows for each scene across opts.durationSec
-      const totalSceneUnits = sceneList.reduce((acc, s) => acc + Math.max(1, s.durationSec), 0);
-      let tCursor = 0;
+      if (sp && sp.temporal.beats.length > 0) {
+        const totalUnits = sp.temporal.beats.reduce((acc, b) => acc + Math.max(0.5, b.durationSec), 0);
+        let tCursor = 0;
 
-      sceneList.forEach((sc, idx) => {
-        const segDuration =
-          idx === sceneList.length - 1
+        sp.temporal.beats.forEach((beat, idx) => {
+          const isLast = idx === sp.temporal.beats.length - 1;
+          const segDuration = isLast
             ? Math.max(0.5, opts.durationSec - tCursor)
-            : (Math.max(1, sc.durationSec) / totalSceneUnits) * opts.durationSec;
-        const startT = tCursor.toFixed(2);
-        const endT = (tCursor + segDuration).toFixed(2);
-        tCursor += segDuration;
+            : (Math.max(0.5, beat.durationSec) / totalUnits) * opts.durationSec;
+          const startT = tCursor.toFixed(2);
+          const endT = (tCursor + segDuration).toFixed(2);
+          const flashEndT = (tCursor + Math.min(0.22, segDuration * 0.25)).toFixed(2);
+          tCursor += segDuration;
 
-        // Comma-free enable expression so FFmpeg never splits inside drawtext
-        const enableExpr =
-          idx === sceneList.length - 1
+          const enableExpr = isLast
             ? `gte(t,${startT})`
             : `gte(t,${startT})*lt(t,${endT})`;
 
-        // Scene tag pill
-        filters.push(
-          `drawtext=${monoFontOpt}text='${escapeDrawtext(sc.kineticTag)}':fontcolor=${secColor}:fontsize=${Math.round(opts.width * 0.028)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.16)}:enable='${enableExpr}'`
-        );
+          // 1. Temporal Transition Flash / Whip-Pan / Glitch Pulse at beat start
+          if (idx > 0 || beat.transitionIn === 'glitch_flash' || beat.transitionIn === 'zoom_punch') {
+            const flashColor =
+              beat.transitionIn === 'glitch_flash'
+                ? secColor
+                : beat.transitionIn === 'zoom_punch'
+                ? hexColor
+                : '0xffffff';
+            filters.push(
+              `drawbox=x=0:y=0:w=iw:h=ih:color=${flashColor}@0.28:t=fill:enable='gte(t,${startT})*lt(t,${flashEndT})'`
+            );
+          }
 
-        // Scene headline
-        const sceneTitleLines = wrapTextLines(sc.title, isWide ? 40 : 22);
-        const titleFontSize = Math.round(opts.width * 0.052);
-        const titleStartY = Math.round(opts.height * 0.27);
-        sceneTitleLines.forEach((line, lIdx) => {
+          // 2. Animated Focal Camera Target Frame simulating zoomStart -> zoomEnd & panX/panY trajectory
+          const zStart = Math.max(0.75, Math.min(1.5, beat.cameraZoomStart || 1.0));
+          const zEnd = Math.max(0.75, Math.min(1.5, beat.cameraZoomEnd || 1.1));
+          const zDelta = (zEnd - zStart).toFixed(3);
+          const panXFactor = (beat.cameraPanX * 0.14).toFixed(3);
+          const panYFactor = (beat.cameraPanY * 0.10).toFixed(3);
+          const prog = `((t-${startT})/${segDuration.toFixed(2)})`;
+          const orbitAmp = beat.cameraKeyframe === 'orbit_360' ? '+iw*0.09*sin(t*2.1)' : '';
+          const fpvBounce = beat.cameraKeyframe === 'fpv_drone' ? '+ih*0.04*sin(t*4.2)' : '';
+
+          const boxWExpr = `iw*0.66*(${zStart.toFixed(2)}+(${zDelta})*${prog})`;
+          const boxHExpr = `ih*0.18*(${zStart.toFixed(2)}+(${zDelta})*${prog})`;
+          const boxXExpr = `(iw-(${boxWExpr}))/2+iw*(${panXFactor})*${prog}${orbitAmp}`;
+          const boxYExpr = `ih*0.405+ih*(${panYFactor})*${prog}${fpvBounce}`;
+
           filters.push(
-            `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xffffff:fontsize=${titleFontSize}:x=(w-text_w)/2:y=${titleStartY + lIdx * Math.round(titleFontSize * 1.28)}:enable='${enableExpr}'`
+            `drawbox=x='${boxXExpr}':y='${boxYExpr}':w='${boxWExpr}':h='${boxHExpr}':color=${idx % 2 === 0 ? hexColor : secColor}@0.35:t=2:enable='${enableExpr}'`
+          );
+
+          // 3. Beat Phase + Camera Keyframe badge
+          const phaseText = escapeDrawtext(
+            `FÁZE ${idx + 1}/${sp.temporal.beats.length} · ${CAMERA_MOTION_LABELS[beat.cameraKeyframe].split('(')[0].trim().toUpperCase()} (${zStart.toFixed(2)}x->${zEnd.toFixed(2)}x)`
+          );
+          filters.push(
+            `drawtext=${monoFontOpt}text='${phaseText}':fontcolor=${secColor}:fontsize=${Math.round(shortEdge * 0.023)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.145)}:enable='${enableExpr}'`
+          );
+
+          // 4. Beat Title / Kinetic Headline (centered well above caption zone)
+          const beatTitleLines = wrapTextLines(beat.beatTitle || opts.title, isWide ? 36 : 24);
+          const titleFontSize = Math.round(shortEdge * 0.044);
+          const titleStartY = Math.round(opts.height * 0.238);
+          beatTitleLines.forEach((line, lIdx) => {
+            filters.push(
+              `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xffffff:fontsize=${titleFontSize}:x=(w-text_w)/2:y=${titleStartY + lIdx * Math.round(titleFontSize * 1.24)}:enable='${enableExpr}'`
+            );
+          });
+
+          // 5. Scene Progression / Kinetic Caption Box (Hormozi Style framed inside camera target box)
+          const capLines = wrapTextLines(beat.kineticCaption || beat.sceneDescription, isWide ? 44 : 28);
+          const subFontSize = Math.round(shortEdge * 0.031);
+          const subStartY = Math.round(opts.height * 0.445);
+          capLines.forEach((line, lIdx) => {
+            filters.push(
+              `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xfef08a:fontsize=${subFontSize}:x=(w-text_w)/2:y=${subStartY + lIdx * Math.round(subFontSize * 1.32)}:box=1:boxcolor=0x09090b@0.88:boxborderw=8:enable='${enableExpr}'`
+            );
+          });
+
+          // 6. Lighting Shift & Transition footer
+          const footerCue = escapeDrawtext(
+            `${TRANSITION_LABELS[beat.transitionIn].split('(')[0].trim()} · ${beat.lightingShift.slice(0, 48)}`
+          );
+          filters.push(
+            `drawtext=${monoFontOpt}text='${footerCue}':fontcolor=0xcbd5e1:fontsize=${Math.round(shortEdge * 0.021)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.745)}:enable='${enableExpr}'`
           );
         });
+      } else {
+        const sceneList =
+          opts.scenes && opts.scenes.length > 0
+            ? opts.scenes
+            : [
+                {
+                  title: opts.title,
+                  subtitle: opts.hook,
+                  visualCue: '3s Hook + Dynamický rám',
+                  durationSec: Math.max(2, Math.round(opts.durationSec * 0.35)),
+                  kineticTag: 'SCÉNA 1/3 · HOOK',
+                },
+                {
+                  title: 'KLÍČOVÉ ŘEŠENÍ V PRAXI',
+                  subtitle: opts.hook,
+                  visualCue: 'Vizuální důkaz & postup',
+                  durationSec: Math.max(2, Math.round(opts.durationSec * 0.35)),
+                  kineticTag: 'SCÉNA 2/3 · DEMO',
+                },
+                {
+                  title: 'DALŠÍ KROK & VÝSLEDEK',
+                  subtitle: opts.cta,
+                  visualCue: 'Výzva k akci + plynulá smyčka',
+                  durationSec: Math.max(2, Math.round(opts.durationSec * 0.3)),
+                  kineticTag: 'SCÉNA 3/3 · CTA',
+                },
+              ];
 
-        // Scene subtitle / caption box
-        const subLines = wrapTextLines(sc.subtitle, isWide ? 50 : 28);
-        const subFontSize = Math.round(opts.width * 0.036);
-        const subStartY = Math.round(opts.height * 0.52);
-        subLines.forEach((line, lIdx) => {
+        const totalSceneUnits = sceneList.reduce((acc, s) => acc + Math.max(1, s.durationSec), 0);
+        let tCursor = 0;
+
+        sceneList.forEach((sc, idx) => {
+          const segDuration =
+            idx === sceneList.length - 1
+              ? Math.max(0.5, opts.durationSec - tCursor)
+              : (Math.max(1, sc.durationSec) / totalSceneUnits) * opts.durationSec;
+          const startT = tCursor.toFixed(2);
+          const endT = (tCursor + segDuration).toFixed(2);
+          tCursor += segDuration;
+
+          const enableExpr =
+            idx === sceneList.length - 1
+              ? `gte(t,${startT})`
+              : `gte(t,${startT})*lt(t,${endT})`;
+
           filters.push(
-            `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xfef08a:fontsize=${subFontSize}:x=(w-text_w)/2:y=${subStartY + lIdx * Math.round(subFontSize * 1.32)}:box=1:boxcolor=0x09090b@0.82:boxborderw=10:enable='${enableExpr}'`
+            `drawtext=${monoFontOpt}text='${escapeDrawtext(sc.kineticTag)}':fontcolor=${secColor}:fontsize=${Math.round(shortEdge * 0.025)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.145)}:enable='${enableExpr}'`
+          );
+
+          const sceneTitleLines = wrapTextLines(sc.title, isWide ? 36 : 22);
+          const titleFontSize = Math.round(shortEdge * 0.048);
+          const titleStartY = Math.round(opts.height * 0.255);
+          sceneTitleLines.forEach((line, lIdx) => {
+            filters.push(
+              `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xffffff:fontsize=${titleFontSize}:x=(w-text_w)/2:y=${titleStartY + lIdx * Math.round(titleFontSize * 1.26)}:enable='${enableExpr}'`
+            );
+          });
+
+          const subLines = wrapTextLines(sc.subtitle, isWide ? 44 : 26);
+          const subFontSize = Math.round(shortEdge * 0.033);
+          const subStartY = Math.round(opts.height * 0.455);
+          subLines.forEach((line, lIdx) => {
+            filters.push(
+              `drawtext=${fontOpt}text='${escapeDrawtext(line)}':fontcolor=0xfef08a:fontsize=${subFontSize}:x=(w-text_w)/2:y=${subStartY + lIdx * Math.round(subFontSize * 1.34)}:box=1:boxcolor=0x09090b@0.88:boxborderw=8:enable='${enableExpr}'`
+            );
+          });
+
+          filters.push(
+            `drawtext=${monoFontOpt}text='${escapeDrawtext(sc.visualCue.slice(0, 48))}':fontcolor=0xcbd5e1:fontsize=${Math.round(shortEdge * 0.022)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.745)}:enable='${enableExpr}'`
           );
         });
-
-        // Visual cue footer
-        filters.push(
-          `drawtext=${monoFontOpt}text='${escapeDrawtext(sc.visualCue.slice(0, 48))}':fontcolor=0xa1a1aa:fontsize=${Math.round(opts.width * 0.023)}:x=(w-text_w)/2:y=${Math.round(opts.height * 0.78)}:enable='${enableExpr}'`
-        );
-      });
+      }
 
       const freq = Math.max(130, Math.min(440, Math.round(opts.bpm * 1.8)));
       const beatHz = (opts.bpm / 60).toFixed(2);
-      const audioExpr = `0.13*sin(2*PI*${freq}*t)*(0.5+0.5*sin(2*PI*${beatHz}*t))+0.06*sin(2*PI*${Math.round(freq * 1.5)}*t)+0.04*sin(2*PI*${Math.round(freq * 2)}*t)`;
+      const audioExpr = `0.14*sin(2*PI*${freq}*t)*(0.6+0.4*sin(2*PI*${beatHz}*t))+0.07*sin(2*PI*${Math.round(freq * 1.5)}*t)+0.04*sin(2*PI*${Math.round(freq * 2.5)}*t)`;
 
       try {
         await execFileAsync(
@@ -671,7 +800,7 @@ export class MediaRenderer {
             '-f',
             'lavfi',
             '-i',
-            `color=c=${opts.bgHex}:s=${opts.width}x${opts.height}:r=24:d=${opts.durationSec}`,
+            `gradients=s=${opts.width}x${opts.height}:d=${opts.durationSec}:r=${renderFps}:n=4:c0=${palette.c0}:c1=${palette.c1}:c2=${palette.c2}:c3=${palette.c3}:x0=0:y0=0:x1=${opts.width}:y1=${opts.height}:speed=0.01`,
             '-f',
             'lavfi',
             '-i',

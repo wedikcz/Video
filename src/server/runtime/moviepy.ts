@@ -4,6 +4,14 @@
  */
 
 import { UserVideoTemplate, VideoCreativeBrief, VideoStoryboard, VideoTemplateCategory } from '../../types/nexus.ts';
+import {
+  ATMOSPHERE_LABELS,
+  CAMERA_MOTION_LABELS,
+  COMPOSITION_LABELS,
+  LIGHTING_LABELS,
+  OPTICS_LABELS,
+  TRANSITION_LABELS,
+} from '../../utils/structuredVideoPrompt.ts';
 
 const CATEGORY_HOOKS: Record<VideoTemplateCategory, string> = {
   tutorial: 'Za 60 sekund zvládnete kompletní postup krok za krokem bez zbytečné teorie.',
@@ -24,23 +32,38 @@ export class MoviePyCompiler {
   ): VideoStoryboard {
     const isShort = brief.aspectRatio === '9:16';
     const fmt = (sec: number) => `00:${Math.max(0, Math.round(sec)).toString().padStart(2, '0')}`;
+    const sp = brief.structuredPrompt;
     let cursor = 0;
-    const scenes = brief.scenes.map((sc, idx) => {
-      const start = cursor;
-      const end = cursor + sc.durationSec;
-      cursor = end;
-      return {
-        id: idx + 1,
-        timeRange: `${fmt(start)} - ${fmt(end)}`,
-        durationSec: sc.durationSec,
-        visual: `${sc.visualCue} (Styl: ${brief.visualStyle}, ${brief.aspectRatio})`,
-        audioVoiceover: sc.subtitle,
-        audioSfx: template?.musicPreset?.sfxPack || `${brief.visualStyle}_sfx (${brief.bpm} BPM)`,
-        kineticText: sc.title,
-        patternInterrupt: idx === 0 ? 'Okamžitý vizuální hook v 0.3s' : 'Dynamický střih s barevným akcentem',
-        bRollKeyword: `${brief.topic} ${sc.kineticTag}`.slice(0, 48),
-      };
-    });
+
+    const scenes =
+      sp && sp.temporal.beats.length > 0
+        ? sp.temporal.beats.map((beat, idx) => ({
+            id: idx + 1,
+            timeRange: `${beat.startSec.toFixed(1)}s - ${beat.endSec.toFixed(1)}s`,
+            durationSec: beat.durationSec,
+            visual: `${beat.sceneDescription} | Subjekt: ${beat.subjectEvolution} | Kamera: ${CAMERA_MOTION_LABELS[beat.cameraKeyframe]} (${beat.cameraZoomStart}x→${beat.cameraZoomEnd}x)`,
+            audioVoiceover: beat.kineticCaption || beat.beatTitle,
+            audioSfx: `${TRANSITION_LABELS[beat.transitionIn]} · ${brief.bpm} BPM`,
+            kineticText: beat.beatTitle,
+            patternInterrupt: `${TRANSITION_LABELS[beat.transitionIn]} · ${beat.lightingShift}`,
+            bRollKeyword: `${sp.style.optics} · ${beat.cameraKeyframe}`.slice(0, 48),
+          }))
+        : brief.scenes.map((sc, idx) => {
+            const start = cursor;
+            const end = cursor + sc.durationSec;
+            cursor = end;
+            return {
+              id: idx + 1,
+              timeRange: `${fmt(start)} - ${fmt(end)}`,
+              durationSec: sc.durationSec,
+              visual: `${sc.visualCue} (Styl: ${brief.visualStyle}, ${brief.aspectRatio})`,
+              audioVoiceover: sc.subtitle,
+              audioSfx: template?.musicPreset?.sfxPack || `${brief.visualStyle}_sfx (${brief.bpm} BPM)`,
+              kineticText: sc.title,
+              patternInterrupt: idx === 0 ? 'Okamžitý vizuální hook v 0.3s' : 'Dynamický střih s barevným akcentem',
+              bRollKeyword: `${brief.topic} ${sc.kineticTag}`.slice(0, 48),
+            };
+          });
 
     const goalCategoryMap: Record<VideoCreativeBrief['goal'], VideoTemplateCategory> = {
       education: 'tutorial',
@@ -61,8 +84,11 @@ export class MoviePyCompiler {
       templateId: template?.id,
       templateCategory: template?.category || goalCategoryMap[brief.goal] || 'viral_hook',
       cta: brief.cta,
-      affiliateBridge: `Cílové publikum: ${brief.audience} · Styl: ${brief.visualStyle} (${brief.tone})`,
+      affiliateBridge: sp
+        ? `Strukturovaný režijní plán · ${COMPOSITION_LABELS[sp.subject.composition]} · ${OPTICS_LABELS[sp.style.optics]} · ${CAMERA_MOTION_LABELS[sp.camera.primaryMotion]}`
+        : `Cílové publikum: ${brief.audience} · Styl: ${brief.visualStyle} (${brief.tone})`,
       scenes,
+      structuredPrompt: sp,
     };
   }
 
@@ -196,21 +222,35 @@ export class MoviePyCompiler {
     const isVertical = storyboard.aspectRatio === '9:16';
     const width = isVertical ? 1080 : 1920;
     const height = isVertical ? 1920 : 1080;
-    const totalDuration = storyboard.scenes.reduce((acc, s) => acc + s.durationSec, 0) || 42;
-    const subColor = template?.subtitleStyle?.highlightColor || '#facc15';
+    const sp = storyboard.structuredPrompt;
+    const totalDuration =
+      sp?.totalDurationSec || storyboard.scenes.reduce((acc, s) => acc + s.durationSec, 0) || 42;
+    const subColor = sp?.style.accentColor || template?.subtitleStyle?.highlightColor || '#facc15';
     const fontName = template?.subtitleStyle?.font || 'DejaVu-Sans-Bold';
     const fontSize = template?.subtitleStyle?.fontSize || (isVertical ? 64 : 52);
     const beatType = template?.musicPreset?.beatType || 'Lo-Fi Synthwave';
     const bpm = template?.musicPreset?.bpm || 128;
+    const fps = sp?.fps || 30;
+
+    const structuredHeader = sp
+      ? `
+Structured Prompt (Zero-API Local Director v2.0):
+  Subjekt:   ${sp.subject.primarySubject} | Akce: ${sp.subject.subjectAction}
+  Prostředí: ${sp.subject.environment} | Kompozice: ${COMPOSITION_LABELS[sp.subject.composition]}
+  Styl:      ${sp.style.visualStyle} | Světlo: ${LIGHTING_LABELS[sp.style.lighting]} | Optika: ${OPTICS_LABELS[sp.style.optics]}
+  Atmosféra: ${ATMOSPHERE_LABELS[sp.style.atmosphere]} | Grading: ${sp.style.colorGrading}
+  Kamera:    ${CAMERA_MOTION_LABELS[sp.camera.primaryMotion]} (Intenzita ${sp.camera.motionIntensity}/10, ${sp.camera.easing}, ${sp.camera.stabilization})
+  Tempo:     ${sp.temporal.pacing} (${sp.temporal.beats.length} časových fází)`
+      : '';
 
     return `#!/usr/bin/env python3
 """
 NEXUS X OS - Automated MoviePy 2.x Video Render Pipeline
 Project: "${storyboard.title}"
-Template: ${template?.name || 'Výchozí virální pipeline'} (${storyboard.templateCategory || 'viral_hook'})
-Style: ${template?.visualStyle || 'Dark Futuristic'} | Music: ${beatType} (${bpm} BPM)
-Format: ${storyboard.aspectRatio} (${width}x${height})
-Platform: ${storyboard.targetPlatform}
+Template: ${template?.name || 'Lokální Strukturovaný Režisér'} (${storyboard.templateCategory || 'viral_hook'})
+Style: ${sp?.style.visualStyle || template?.visualStyle || 'Dark Futuristic'} | Music: ${beatType} (${bpm} BPM)
+Format: ${storyboard.aspectRatio} (${width}x${height}) @ ${fps} FPS
+Platform: ${storyboard.targetPlatform}${structuredHeader}
 """
 
 import os
@@ -227,27 +267,35 @@ from moviepy import (
 
 WIDTH = ${width}
 HEIGHT = ${height}
-FPS = 30
+FPS = ${fps}
 SUBTITLE_COLOR = "${subColor}"
 FONT_NAME = "${fontName}"
 OUTPUT_FILE = "output_nexus_${storyboard.templateCategory || 'viral'}_${storyboard.aspectRatio.replace(':', '_')}.mp4"
 
-print("[NEXUS X] Starting video render engine...")
+print("[NEXUS X] Starting local structured video render engine...")
 
 # 1. Background Canvas Layer (${totalDuration}s)
 bg_color = ColorClip(size=(WIDTH, HEIGHT), color=(15, 17, 23), duration=${totalDuration})
 
-# 2. Scene Clips Compilation
+# 2. Temporal Scene Clips & Camera Keyframes Compilation
 scenes = []
 ${storyboard.scenes
-  .map(
-    (s, idx) => `
+  .map((s, idx) => {
+    const beat = sp?.temporal.beats[idx];
+    const camComment = beat
+      ? `# Camera Keyframe: ${beat.cameraKeyframe} (zoom ${beat.cameraZoomStart}x -> ${beat.cameraZoomEnd}x, panX=${beat.cameraPanX}, panY=${beat.cameraPanY}, transition=${beat.transitionIn})`
+      : '';
+    const zoomScaleExpr = beat
+      ? `.resized(lambda t: ${beat.cameraZoomStart} + (${(beat.cameraZoomEnd - beat.cameraZoomStart).toFixed(2)}) * min(1.0, t / ${Math.max(0.5, s.durationSec)}))`
+      : '';
+    return `
 # --- Scene ${idx + 1}: ${s.timeRange} ---
+${camComment}
 scene_${idx + 1}_bg = ColorClip(
     size=(WIDTH, HEIGHT),
     color=(${idx % 2 === 0 ? '20, 24, 39' : '10, 15, 29'}),
     duration=${s.durationSec}
-)
+)${zoomScaleExpr}
 
 txt_${idx + 1} = TextClip(
     text="${s.kineticText.replace(/"/g, '\\"')}",
@@ -260,8 +308,8 @@ txt_${idx + 1} = TextClip(
 
 scene_${idx + 1} = CompositeVideoClip([scene_${idx + 1}_bg, txt_${idx + 1}])
 scenes.append(scene_${idx + 1})
-`
-  )
+`;
+  })
   .join('\n')}
 
 final_video = concatenate_videoclips(scenes, method="compose")

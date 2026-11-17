@@ -8,10 +8,16 @@ import {
   FactoryAsset,
   MediaRenderStage,
   SmartTrendAnalysisResult,
+  StructuredPromptScore,
+  StructuredVideoPrompt,
   VideoStoryboard,
   OpenGenModelSpec,
   OpenGenCreditsState,
   OpenGenGenerationRequest,
+  OpenGenCameraMotion,
+  VideoVisualStyle,
+  MonetizationAuditResult,
+  AiSmartEnhanceResponse,
 } from '../types/nexus.ts';
 
 export interface SmartVideoProgressUpdate {
@@ -30,6 +36,7 @@ export interface SmartVideoGenerationResult {
   asset: FactoryAsset;
   storyboard?: VideoStoryboard;
   moviePyScript?: string;
+  structuredPrompt?: StructuredVideoPrompt;
   analysis?: SmartTrendAnalysisResult;
   received202Accepted: boolean;
   pollCount: number;
@@ -45,6 +52,7 @@ export interface SmartVideoTriggerOptions {
     asset: FactoryAsset;
     storyboard?: VideoStoryboard;
     moviePyScript?: string;
+    structuredPrompt?: StructuredVideoPrompt;
     analysis?: SmartTrendAnalysisResult;
     retryAfterSeconds: number;
   }) => void;
@@ -234,6 +242,7 @@ export class SmartVideoOrchestrator {
       templateId?: string;
       threadId?: string;
       dryRun?: boolean;
+      structuredPrompt?: StructuredVideoPrompt;
     },
     options: SmartVideoTriggerOptions = {}
   ): Promise<SmartVideoGenerationResult> {
@@ -247,6 +256,7 @@ export class SmartVideoOrchestrator {
         format: params.format,
         templateId: params.templateId,
         threadId: params.threadId || 'th-main-001',
+        structuredPrompt: params.structuredPrompt,
         dryRun: Boolean(params.dryRun),
         async: true,
       }),
@@ -263,6 +273,7 @@ export class SmartVideoOrchestrator {
         asset: data.asset,
         storyboard: data.storyboard,
         moviePyScript: data.moviePyScript,
+        structuredPrompt: data.structuredPrompt || data.asset?.structuredPrompt,
         retryAfterSeconds,
       });
       options.onProgress?.({
@@ -283,6 +294,10 @@ export class SmartVideoOrchestrator {
         asset: polled.asset,
         storyboard: data.storyboard || polled.asset.videoStoryboard,
         moviePyScript: data.moviePyScript || polled.asset.moviePyScript,
+        structuredPrompt:
+          data.structuredPrompt ||
+          polled.asset.structuredPrompt ||
+          polled.asset.videoBrief?.structuredPrompt,
         received202Accepted: true,
         pollCount: polled.pollCount,
       };
@@ -298,6 +313,7 @@ export class SmartVideoOrchestrator {
       asset: readyAsset,
       storyboard: data.storyboard,
       moviePyScript: data.moviePyScript,
+      structuredPrompt: data.structuredPrompt || readyAsset?.structuredPrompt,
       received202Accepted: false,
       pollCount: 0,
     };
@@ -424,23 +440,135 @@ export class SmartVideoOrchestrator {
     return data;
   }
 
+  public async parseStructuredPrompt(params: {
+    rawPrompt: string;
+    aspectRatio?: '9:16' | '16:9';
+    durationSec?: number;
+    fps?: 24 | 30 | 60;
+    visualStyle?: VideoVisualStyle;
+    cameraMotion?: OpenGenCameraMotion;
+    motionIntensity?: number;
+    negativePrompt?: string;
+    signal?: AbortSignal;
+  }): Promise<{
+    engine: string;
+    structuredPrompt: StructuredVideoPrompt;
+    score: StructuredPromptScore;
+  }> {
+    const res = await fetch(this.url('/api/v1/video/structured-prompt/parse'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: params.signal,
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Lokální rozklad promptu selhal.');
+    return data;
+  }
+
+  public async enhanceStructuredPrompt(params: {
+    structuredPrompt?: StructuredVideoPrompt;
+    rawPrompt?: string;
+    cameraMotion?: OpenGenCameraMotion;
+    visualStyle?: VideoVisualStyle;
+    motionIntensity?: number;
+    signal?: AbortSignal;
+  }): Promise<{
+    engine: string;
+    structuredPrompt: StructuredVideoPrompt;
+    compiledText: string;
+    tips: string[];
+    score: StructuredPromptScore;
+  }> {
+    const res = await fetch(this.url('/api/v1/video/structured-prompt/enhance'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: params.signal,
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Lokální vylepšení promptu selhalo.');
+    return data;
+  }
+
+  public async optimizeForMonetization(params: {
+    structuredPrompt?: StructuredVideoPrompt;
+    rawPrompt?: string;
+    blueprintId?: string;
+    signal?: AbortSignal;
+  }): Promise<{
+    engine: string;
+    structuredPrompt: StructuredVideoPrompt;
+    audit: MonetizationAuditResult;
+    compiledText: string;
+  }> {
+    const res = await fetch(this.url('/api/v1/video/structured-prompt/monetize'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: params.signal,
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Optimalizace pro monetizaci selhala.');
+    return data;
+  }
+
+  public async aiSmartEnhancePrompt(params: {
+    structuredPrompt?: StructuredVideoPrompt;
+    rawPrompt?: string;
+    selectedStyleTagId?: string;
+    signal?: AbortSignal;
+  }): Promise<AiSmartEnhanceResponse> {
+    const res = await fetch(this.url('/api/v1/video/structured-prompt/ai-enhance'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: params.signal,
+      body: JSON.stringify({
+        structuredPrompt: params.structuredPrompt,
+        rawPrompt: params.rawPrompt,
+        selectedStyleTagId: params.selectedStyleTagId,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || 'AI Smart Enhance selhal.');
+    }
+    return data as AiSmartEnhanceResponse;
+  }
+
   public async enhancePrompt(
     prompt: string,
-    params?: { modelId?: string; style?: string; camera?: string; signal?: AbortSignal }
-  ): Promise<{ originalPrompt: string; enhancedPrompt: string; tips: string[] }> {
+    params?: {
+      modelId?: string;
+      style?: string;
+      camera?: string;
+      structuredPrompt?: StructuredVideoPrompt;
+      motionIntensity?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<{
+    originalPrompt: string;
+    enhancedPrompt: string;
+    compiledText?: string;
+    structuredPrompt?: StructuredVideoPrompt;
+    score?: StructuredPromptScore;
+    tips: string[];
+  }> {
     const res = await fetch(this.url('/api/v1/opengen/prompt-enhance'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: params?.signal,
       body: JSON.stringify({
         prompt,
+        structuredPrompt: params?.structuredPrompt,
         modelId: params?.modelId,
         style: params?.style,
         camera: params?.camera,
+        motionIntensity: params?.motionIntensity,
       }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data?.error || 'AI Prompt Magic selhal.');
+    if (!res.ok) throw new Error(data?.error || 'Lokální vylepšení promptu selhalo.');
     return data;
   }
 
@@ -460,7 +588,7 @@ export class SmartVideoOrchestrator {
 
     const data = await res.json();
     if (!res.ok && res.status !== 202) {
-      throw new Error(data?.error || 'OpenGen generování videa selhalo.');
+      throw new Error(data?.error || 'Generování videa selhalo.');
     }
 
     if (res.status === 202 && data.asset?.id) {
@@ -469,6 +597,7 @@ export class SmartVideoOrchestrator {
         asset: data.asset,
         storyboard: data.storyboard,
         moviePyScript: data.moviePyScript,
+        structuredPrompt: data.structuredPrompt || data.asset?.structuredPrompt,
         retryAfterSeconds,
       });
       options.onProgress?.({
@@ -478,7 +607,7 @@ export class SmartVideoOrchestrator {
         progressPercent: data.asset.progressPercent ?? 10,
         progressStage: data.asset.progressStage || 'queued',
         workerMessage:
-          data.asset.workerMessage || `HTTP 202 Accepted · OpenGen ${data.model?.name || ''} předáno workeru.`,
+          data.asset.workerMessage || `HTTP 202 Accepted · ${data.model?.name || ''} předáno workeru.`,
         faststartVerified: false,
         pollAttempt: 0,
         retryAfterSeconds,
@@ -489,6 +618,10 @@ export class SmartVideoOrchestrator {
         asset: polled.asset,
         storyboard: data.storyboard || polled.asset.videoStoryboard,
         moviePyScript: data.moviePyScript || polled.asset.moviePyScript,
+        structuredPrompt:
+          data.structuredPrompt ||
+          polled.asset.structuredPrompt ||
+          polled.asset.videoBrief?.structuredPrompt,
         model: data.model,
         creditsUsed: data.creditsUsed,
         creditsRemaining: data.creditsRemaining,
@@ -502,6 +635,7 @@ export class SmartVideoOrchestrator {
       asset: verified,
       storyboard: data.storyboard,
       moviePyScript: data.moviePyScript,
+      structuredPrompt: data.structuredPrompt || verified.structuredPrompt,
       model: data.model,
       creditsUsed: data.creditsUsed,
       creditsRemaining: data.creditsRemaining,

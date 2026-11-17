@@ -23,10 +23,20 @@ import {
   ShieldCheck,
   Film,
   Server,
+  Sparkles,
+  MessageSquareMore,
 } from 'lucide-react';
 import { SystemPerformance, TeamMember, WorkspaceAccount } from '../types/nexus.ts';
 
-export type MainAppTab = 'chat' | 'agents' | 'revenue' | 'factory' | 'vault' | 'analytics' | 'accounts';
+export type MainAppTab =
+  | 'chat'
+  | 'agents'
+  | 'revenue'
+  | 'factory'
+  | 'vault'
+  | 'comments'
+  | 'analytics'
+  | 'accounts';
 
 interface NavbarProps {
   activeTab: MainAppTab;
@@ -36,6 +46,7 @@ interface NavbarProps {
   onOpenDocs: () => void;
   onOpenEvals: () => void;
   onOpenPublish: () => void;
+  onOpenNotebookLM?: () => void;
   activeAgentsCount: number;
   activeAccount?: WorkspaceAccount;
   currentActor?: TeamMember;
@@ -49,6 +60,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenDocs,
   onOpenEvals,
   onOpenPublish,
+  onOpenNotebookLM,
   activeAccount,
   currentActor,
 }) => {
@@ -113,23 +125,23 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-zinc-800/80 bg-zinc-950/95 backdrop-blur-md">
-      <div className="flex h-14 items-center justify-between gap-2 px-3 xl:px-5">
+      <div className="flex h-14 items-center justify-between gap-1.5 px-2.5 xl:px-4">
         {/* Left: Branding */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           <div className="flex h-7 w-7 items-center justify-center rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
             <Layers className="h-4 w-4" />
           </div>
-          <span className="font-mono text-xs xl:text-sm font-bold tracking-wider text-white whitespace-nowrap">
+          <span className="font-mono text-xs font-bold tracking-wider text-white whitespace-nowrap">
             NEXUS X OS
           </span>
         </div>
 
         {/* Center: Primary Navigation Tabs */}
-        <nav aria-label="Hlavní navigace" className="flex items-center gap-1 overflow-x-auto py-1">
+        <nav aria-label="Hlavní navigace" className="flex items-center gap-0.5 overflow-x-auto py-1">
           <button
             type="button"
             onClick={() => setActiveTab('chat')}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 text-[11px] xl:text-xs font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'chat'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -142,7 +154,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('agents')}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 text-[11px] xl:text-xs font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'agents'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -155,7 +167,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('revenue')}
-            className={`flex items-center gap-1.5 rounded px-2 py-1 text-[11px] xl:text-xs font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'revenue'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -190,6 +202,20 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <Film className="h-3.5 w-3.5" />
             <span className="font-medium">Media Vault</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="nav-tab-comments"
+            onClick={() => setActiveTab('comments')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+              activeTab === 'comments'
+                ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
+                : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
+            }`}
+          >
+            <MessageSquareMore className="h-3.5 w-3.5" />
+            <span className="font-medium">AI Komentáře</span>
           </button>
 
           <button
@@ -260,15 +286,29 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </span>
               </div>
 
-              <div className="hidden sm:flex items-center gap-1 text-[11px] text-zinc-400">
+              <div className="hidden 2xl:flex items-center gap-1 text-[11px] text-zinc-400">
                 <HardDrive className="h-3 w-3 text-amber-400" />
                 <span>{performance.memoryUsageMb} MB</span>
               </div>
 
-              <div className="hidden xl:flex items-center gap-1 text-[11px] text-zinc-400">
+              <div className="hidden 2xl:flex items-center gap-1 text-[11px] text-zinc-400">
                 <Activity className="h-3 w-3 text-emerald-400" />
                 <span>{performance.activeJobsCount} ÚLOH</span>
               </div>
+            </button>
+          )}
+
+          {/* Google NotebookLM Video Studio button */}
+          {onOpenNotebookLM && (
+            <button
+              type="button"
+              data-testid="open-notebooklm-navbar"
+              onClick={onOpenNotebookLM}
+              className="flex items-center gap-1 rounded border border-blue-500/40 bg-blue-500/15 px-2 py-1 text-[11px] font-mono font-semibold text-blue-300 hover:bg-blue-500/25 hover:text-white whitespace-nowrap shrink-0 transition"
+              title="Google NotebookLM Studio · Přizpůsobení videopřehledu"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-blue-400" />
+              <span className="hidden md:inline">NotebookLM</span>
             </button>
           )}
 

@@ -58,7 +58,13 @@ export const EvalsModal: React.FC<EvalsModalProps> = ({ isOpen, onClose }) => {
               </p>
             </div>
           </div>
-          <button onClick={onClose} className="rounded p-1 text-zinc-400 hover:bg-zinc-900 hover:text-white">
+          <button
+            type="button"
+            aria-label="Zavřít"
+            data-testid="close-evals-modal"
+            onClick={onClose}
+            className="rounded p-1 text-zinc-400 hover:bg-zinc-900 hover:text-white"
+          >
             <X className="h-5 w-5" />
           </button>
         </div>

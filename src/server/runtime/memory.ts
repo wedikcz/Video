@@ -8,8 +8,7 @@ import { MemoryRecord } from '../../types/nexus.ts';
 
 export class MemoryService {
   /**
-   * Simple deterministic semantic vector generator for text
-   * Provides 1536-dimensional mock or word-hash embeddings for deterministic cosine search
+   * Deterministic lexical Jaccard & BM25 similarity scoring for hybrid memory retrieval
    */
   public static calculateTextSimilarity(textA: string, textB: string): number {
     const wordsA = new Set(textA.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
@@ -37,7 +36,8 @@ export class MemoryService {
     let score = 0;
 
     for (const term of queryTerms) {
-      const occurrences = (contentLower.match(new RegExp(term, 'g')) || []).length;
+      const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const occurrences = (contentLower.match(new RegExp(escapedTerm, 'g')) || []).length;
       if (occurrences > 0) {
         // Simple BM25 term frequency saturation approximation
         const tf = (occurrences * 2.2) / (occurrences + 1.2);

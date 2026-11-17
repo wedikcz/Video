@@ -12,6 +12,14 @@ import {
   analyzeCommentWithMultiCore,
   pickBestReplyStrategy,
 } from './commentIntelligence.ts';
+import { runTitanCoreMadLipz } from '../../engines/titancore_madlipz.ts';
+import {
+  buildAgentWorkflowPlan,
+  createComputeInstanceRecord,
+  createServerlessEndpointRecord,
+  executeInfraWorkflow,
+  runFalUnifiedInference,
+} from '../../engines/fal_infrastructure.ts';
 import { FactoryAsset, VideoCreativeBrief } from '../../types/nexus.ts';
 
 export interface ToolDefinition {
@@ -709,6 +717,175 @@ toolsRegistry.set('autopilot_comment_swarm', {
       leadsSynced,
       kpis: db.getCommentSwarmKpis(),
     };
+  },
+});
+
+// 15. run_titancore_madlipz
+toolsRegistry.set('run_titancore_madlipz', {
+  name: 'run_titancore_madlipz',
+  description:
+    'Spustí multi-engine self-healing jádro GODMODE-TITANCORE + MadLipz CZ pro YPP-safe Shorts (10–25 s, <= 3.5 slova/s, YPP >= 92).',
+  parameters: z.object({
+    visualDescription: z.string().min(3).describe('Popis vizuální scény pro český dabing'),
+    durationSec: z.number().min(10).max(25).default(15).describe('Cílová stopáž v sekundách'),
+    seriesName: z.string().default('MadLipz CZ Série').describe('Název série'),
+    episodeNumber: z.number().int().min(1).default(1).describe('Číslo dílu'),
+    humorStyle: z.string().optional().describe('Volitelný styl humoru'),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async ({ visualDescription, durationSec = 15, seriesName = 'MadLipz CZ Série', episodeNumber = 1, humorStyle }, context) => {
+    const result = await runTitanCoreMadLipz({
+      visualDescription,
+      durationSec,
+      seriesName,
+      episodeNumber,
+      humorStyle,
+    });
+
+    if (!context?.dryRun) {
+      db.activities.unshift({
+        id: `act-${Date.now()}-tc-tool`,
+        title: `TitanCore nástroj: ${result.manifest.series_name} #${result.manifest.episode_number}`,
+        description: `YPP ${result.manifest.ypp_score}/100 · Healing ${result.manifest.healing_iterations}x · Engine ${result.manifest.engine_used}`,
+        agent: 'Video Agent',
+        timestamp: new Date().toISOString(),
+        type: 'action',
+      });
+    }
+
+    return {
+      success: true,
+      dryRun: Boolean(context?.dryRun),
+      manifest: result.manifest,
+      audit: result.audit,
+      traceMeta: result.traceMeta,
+    };
+  },
+});
+
+// 16. run_fal_model_api
+toolsRegistry.set('run_fal_model_api', {
+  name: 'run_fal_model_api',
+  description:
+    'Spustí jednotné Model API (1 500+ modelů: GPT Image 2.6, FLUX 3, H3 Max, Seedance 2.5, Meshy 7.1, audio) přes fal Inference Engine™ (až 10× zrychlení).',
+  parameters: z.object({
+    modelId: z.string().default('fal-ai/flux-3/pro'),
+    prompt: z.string().min(2),
+    aspectRatio: z.enum(['1:1', '9:16', '16:9']).default('16:9'),
+    inferenceEngineAccelerated: z.boolean().default(true),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async ({ modelId, prompt, aspectRatio, inferenceEngineAccelerated }, context) => {
+    const run = await runFalUnifiedInference({
+      modelId,
+      prompt,
+      aspectRatio,
+      inferenceEngineAccelerated,
+    });
+    if (!context?.dryRun) {
+      db.falInferenceRuns.unshift(run);
+      db.activities.unshift({
+        id: `act-${Date.now()}-fal-inf`,
+        title: `fal Inference Engine™: ${run.modelName}`,
+        description: `${run.speedupFactor}× zrychlení (${run.actualLatencyMs} ms) · ${run.outputSummary}`,
+        agent: 'CTO Agent',
+        timestamp: new Date().toISOString(),
+        type: 'action',
+      });
+    }
+    return { success: true, dryRun: Boolean(context?.dryRun), run };
+  },
+});
+
+// 17. deploy_fal_serverless
+toolsRegistry.set('deploy_fal_serverless', {
+  name: 'deploy_fal_serverless',
+  description: 'Jedním kliknutím nasadí vlastní váhy nebo LoRA na zabezpečený serverless endpoint.',
+  parameters: z.object({
+    name: z.string().min(2),
+    baseModel: z.string().default('fal-ai/flux-3/pro'),
+    weightsSourceUrl: z.string().default('s3://nexus-weights/custom-lora.safetensors'),
+    gpuProfile: z.enum(['rtx-4090', 'h100-sxm', 'h200-sxm', 'b200-hgx', 'b300-ultra']).default('h100-sxm'),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async (args, context) => {
+    const endpoint = createServerlessEndpointRecord({
+      ...args,
+      visibility: 'private',
+      minReplicas: 0,
+      maxReplicas: 8,
+      scaleToZeroSec: 90,
+    });
+    if (!context?.dryRun) {
+      db.serverlessEndpoints.unshift(endpoint);
+      db.activities.unshift({
+        id: `act-${Date.now()}-fal-ep`,
+        title: `Serverless Endpoint nasazen: ${endpoint.name}`,
+        description: `URL: ${endpoint.endpointUrl} (${endpoint.gpuProfile})`,
+        agent: 'Automation Agent',
+        timestamp: new Date().toISOString(),
+        type: 'action',
+      });
+    }
+    return { success: true, dryRun: Boolean(context?.dryRun), endpoint };
+  },
+});
+
+// 18. provision_fal_compute
+toolsRegistry.set('provision_fal_compute', {
+  name: 'provision_fal_compute',
+  description: 'Pronajme dedikovaný GPU cluster (RTX, H100, H200, B200, B300) pro výpočty a trénink.',
+  parameters: z.object({
+    gpuId: z.enum(['rtx-4090', 'rtx-5090', 'h100-sxm', 'h200-sxm', 'b200-hgx', 'b300-ultra']).default('b200-hgx'),
+    gpuCount: z.number().int().min(1).max(8).default(1),
+    workload: z.enum(['inference', 'lora_training', 'fine_tuning', 'custom_container']).default('lora_training'),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async (args, context) => {
+    const instance = createComputeInstanceRecord({
+      ...args,
+      region: 'eu-central-prague',
+    });
+    if (!context?.dryRun) {
+      db.computeGpuInstances.unshift(instance);
+      db.activities.unshift({
+        id: `act-${Date.now()}-fal-gpu`,
+        title: `Compute GPU pronajato: ${instance.gpuCount}× ${instance.gpuName}`,
+        description: `${instance.totalVramGb} GB VRAM · $${instance.hourlyCostUsd}/h (${instance.region})`,
+        agent: 'CTO Agent',
+        timestamp: new Date().toISOString(),
+        type: 'action',
+      });
+    }
+    return { success: true, dryRun: Boolean(context?.dryRun), instance };
+  },
+});
+
+// 19. run_fal_agent_workflow
+toolsRegistry.set('run_fal_agent_workflow', {
+  name: 'run_fal_agent_workflow',
+  description: 'Naplánuje a spustí multi-modální workflow přes fal Agent.',
+  parameters: z.object({
+    goal: z.string().min(3),
+  }),
+  sideEffect: true,
+  requiredPermissions: ['write:factory'],
+  execute: async ({ goal }, context) => {
+    const plan = buildAgentWorkflowPlan(goal);
+    const workflowRun = await executeInfraWorkflow({
+      name: plan.name,
+      goal,
+      mode: 'fal_agent',
+      steps: plan.steps,
+    });
+    if (!context?.dryRun) {
+      db.infraWorkflowRuns.unshift(workflowRun);
+    }
+    return { success: true, dryRun: Boolean(context?.dryRun), workflowRun };
   },
 });
 

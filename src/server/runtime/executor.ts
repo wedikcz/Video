@@ -147,13 +147,15 @@ export class ToolExecutor {
     let attempt = 0;
     let lastError: any = null;
 
+    const effectiveTimeoutMs = options.timeoutMs ?? this.TOOL_TIMEOUT_MS;
+
     while (attempt <= this.MAX_RETRIES) {
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       try {
         const timeoutPromise = new Promise((_, reject) => {
           timeoutHandle = setTimeout(
-            () => reject(new Error(`Timeout vypršel (${this.TOOL_TIMEOUT_MS} ms)`)),
-            this.TOOL_TIMEOUT_MS
+            () => reject(new Error(`Timeout vypršel (${effectiveTimeoutMs} ms)`)),
+            effectiveTimeoutMs
           );
         });
 

@@ -25,6 +25,7 @@ import {
   Server,
   Sparkles,
   MessageSquareMore,
+  Cloud,
 } from 'lucide-react';
 import { SystemPerformance, TeamMember, WorkspaceAccount } from '../types/nexus.ts';
 
@@ -33,6 +34,7 @@ export type MainAppTab =
   | 'agents'
   | 'revenue'
   | 'factory'
+  | 'infra'
   | 'vault'
   | 'comments'
   | 'analytics'
@@ -180,7 +182,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('factory')}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'factory'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -192,9 +194,23 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           <button
             type="button"
+            data-testid="nav-tab-infra"
+            onClick={() => setActiveTab('infra')}
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+              activeTab === 'infra'
+                ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
+                : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
+            }`}
+          >
+            <Cloud className="h-3.5 w-3.5" />
+            <span className="font-medium">Fal Cloud</span>
+          </button>
+
+          <button
+            type="button"
             data-testid="nav-tab-vault"
             onClick={() => setActiveTab('vault')}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'vault'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -208,20 +224,20 @@ export const Navbar: React.FC<NavbarProps> = ({
             type="button"
             data-testid="nav-tab-comments"
             onClick={() => setActiveTab('comments')}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'comments'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
             }`}
           >
             <MessageSquareMore className="h-3.5 w-3.5" />
-            <span className="font-medium">AI Komentáře</span>
+            <span className="font-medium"><span className="hidden 2xl:inline">AI </span>Komentáře</span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('analytics')}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'analytics'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
@@ -234,14 +250,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('accounts')}
-            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
+            className={`flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-mono whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'accounts'
                 ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40'
                 : 'text-zinc-400 hover:text-white hover:bg-zinc-900 border border-transparent'
             }`}
           >
             <ShieldCheck className="h-3.5 w-3.5" />
-            <span className="font-medium">Účty & Tým</span>
+            <span className="font-medium">Účty<span className="hidden 2xl:inline"> &amp; Tým</span></span>
           </button>
         </nav>
 

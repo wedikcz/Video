@@ -97,6 +97,39 @@ export function generateOpenApi31Spec() {
           },
           required: ['id', 'title', 'channel', 'projectionCzk', 'confidence', 'status'],
         },
+        TitanCoreBlock: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', example: 'blk-1-hook' },
+            role: { type: 'string', enum: ['hook', 'setup', 'escalation', 'punchline_loop'] },
+            start_sec: { type: 'number', example: 0.0 },
+            end_sec: { type: 'number', example: 2.0 },
+            voiceover_cz: { type: 'string', example: 'Počkejte, tohle nevymyslí ani český úřad!' },
+            subtitle_text: { type: 'string', example: 'Počkejte, tohle nevymyslí ani český úřad!' },
+            visual_direction: { type: 'string' },
+            words_per_sec: { type: 'number', example: 3.0 },
+          },
+          required: ['id', 'role', 'start_sec', 'end_sec', 'voiceover_cz', 'subtitle_text', 'visual_direction'],
+        },
+        TitanCoreManifest: {
+          type: 'object',
+          properties: {
+            pipeline_target: { type: 'string', enum: ['wedikcz/video'] },
+            series_name: { type: 'string', example: 'Kancelář CZ' },
+            episode_number: { type: 'integer', example: 1 },
+            humor_angle: { type: 'string' },
+            target_duration_sec: { type: 'number', minimum: 10, maximum: 25, example: 15 },
+            ypp_score: { type: 'number', minimum: 0, maximum: 100, example: 96 },
+            healing_iterations: { type: 'integer', minimum: 0, maximum: 3, example: 0 },
+            engine_used: { type: 'string', example: 'gemini-2.5-pro' },
+            blocks: { type: 'array', items: { $ref: '#/components/schemas/TitanCoreBlock' } },
+            delivery: { type: 'object' },
+            youtube_metadata: { type: 'object' },
+            asset_bridge: { type: 'object' },
+            next_commands: { type: 'array', items: { type: 'string' }, minItems: 6 },
+          },
+          required: ['pipeline_target', 'series_name', 'target_duration_sec', 'ypp_score', 'blocks', 'next_commands'],
+        },
         FactoryAsset: {
           type: 'object',
           properties: {
@@ -109,10 +142,17 @@ export function generateOpenApi31Spec() {
             meta: { type: 'string' },
             tags: { type: 'array', items: { type: 'string' } },
             status: { type: 'string', enum: ['queued', 'rendering', 'ready', 'failed'] },
+            renderStatus: { type: 'string', enum: ['queued', 'rendering', 'ready', 'failed'] },
+            yppScore: { type: 'number', example: 96 },
+            healingIterations: { type: 'integer', example: 0 },
+            openSourceGenPrompt: { type: 'string' },
+            agnesManifest: { type: 'object' },
+            titanCoreManifest: { $ref: '#/components/schemas/TitanCoreManifest' },
+            nextCommands: { type: 'array', items: { type: 'string' } },
             mimeType: { type: 'string', example: 'video/mp4' },
             sizeBytes: { type: 'integer', example: 64500 },
-            durationSec: { type: 'number', example: 6 },
-            resolution: { type: 'string', example: '720x1280' },
+            durationSec: { type: 'number', example: 15 },
+            resolution: { type: 'string', example: '1080x1920' },
             sha256: { type: 'string' },
             streamUrl: { type: 'string', example: '/api/v1/assets/asset-001/stream' },
             downloadUrl: { type: 'string', example: '/api/v1/assets/asset-001/download' },
@@ -286,7 +326,9 @@ export function generateOpenApi31Spec() {
       },
       '/v1/factory/generations': {
         post: {
-          summary: 'Generování obsahu na výrobních linkách (video, ad, funnel) s podporou 202 Accepted async workeru',
+          summary: 'GODMODE-TITANCORE MadLipz CZ YPP & standardní výrobní linky (video, ad, funnel)',
+          description:
+            'Při předání `visualDescription` (případně `line: "titancore"`) spustí multi-engine self-healing jádro TitanCore, uloží manifest do `./tmp/`, zaloguje RunTrace do `/v1/runs/{id}`, asynchronně spustí MoviePy 2.x YPP render a vrátí validovaný manifest včetně min. 6 rozkazovacích vět.',
           requestBody: {
             required: true,
             content: {
@@ -294,27 +336,98 @@ export function generateOpenApi31Spec() {
                 schema: {
                   type: 'object',
                   properties: {
-                    line: { type: 'string', enum: ['video', 'ad', 'funnel'] },
+                    visualDescription: {
+                      type: 'string',
+                      example: 'Kočka v kanceláři zírá na prázdnou misku při pondělní poradě',
+                    },
+                    durationSec: { type: 'number', minimum: 10, maximum: 25, default: 15 },
+                    seriesName: { type: 'string', example: 'Kancelář CZ' },
+                    episodeNumber: { type: 'integer', minimum: 1, default: 1 },
+                    humorStyle: { type: 'string', example: 'suchý sarkasmus' },
+                    rawVideoPath: { type: 'string' },
+                    dubAudioPath: { type: 'string' },
+                    line: { type: 'string', enum: ['video', 'ad', 'funnel', 'titancore'] },
                     topic: { type: 'string' },
                     format: { type: 'string', default: '9:16' },
                     templateId: { type: 'string' },
                     async: { type: 'boolean', default: false },
                   },
-                  required: ['line', 'topic'],
                 },
               },
             },
           },
           responses: {
-            '200': { description: 'Vygenerované assety' },
-            '202': { description: 'Úloha přijata do pozadí (Retry-After + statusUrl pro polling)' },
+            '200': {
+              description: 'Vygenerované assety standardních linek včetně telemetrie a 6 rozkazovacích příkazů',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      runId: { type: 'string' },
+                      traceUrl: { type: 'string' },
+                      next_commands: { type: 'array', items: { type: 'string' }, minItems: 6 },
+                      asset: { $ref: '#/components/schemas/FactoryAsset' },
+                    },
+                  },
+                },
+              },
+            },
+            '201': {
+              description: 'TitanCore MadLipz CZ YPP manifest vygenerován, validován a zařazen k MoviePy 2.x renderu',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      status: { type: 'string', example: 'ok' },
+                      runId: { type: 'string' },
+                      traceUrl: { type: 'string' },
+                      manifestPath: { type: 'string' },
+                      ypp_score: { type: 'number', example: 96 },
+                      healing_iterations: { type: 'integer', example: 0 },
+                      next_commands: { type: 'array', items: { type: 'string' }, minItems: 6 },
+                      manifest: { $ref: '#/components/schemas/TitanCoreManifest' },
+                      asset: { $ref: '#/components/schemas/FactoryAsset' },
+                    },
+                  },
+                },
+              },
+            },
+            '202': {
+              description: 'Úloha přijata do pozadí (Retry-After + statusUrl pro polling + telemetrie + 6 next_commands)',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      status: { type: 'string', example: 'accepted' },
+                      statusCode: { type: 'integer', example: 202 },
+                      runId: { type: 'string' },
+                      traceUrl: { type: 'string' },
+                      next_commands: { type: 'array', items: { type: 'string' }, minItems: 6 },
+                      asset: { $ref: '#/components/schemas/FactoryAsset' },
+                    },
+                  },
+                },
+              },
+            },
           },
         },
       },
       '/v1/factory/assets': {
         get: {
-          summary: 'Knihovna vygenerovaných assetů',
-          responses: { '200': { description: 'Seznam assetů' } },
+          summary: 'Knihovna vygenerovaných assetů obohacená o YPP skóre, stav renderu, OpenSourceGen a Agnes manifest',
+          responses: {
+            '200': {
+              description: 'Seznam assetů',
+              content: {
+                'application/json': {
+                  schema: { type: 'array', items: { $ref: '#/components/schemas/FactoryAsset' } },
+                },
+              },
+            },
+          },
         },
       },
       '/api/v1/assets': {
@@ -487,6 +600,12 @@ export function generateOpenApi31Spec() {
           responses: { '200': { description: 'Systém je zdravý' } },
         },
       },
+      '/readyz': {
+        get: {
+          summary: 'Production readiness probe (prostředí, úložiště médií, aktivní assety a endpointy)',
+          responses: { '200': { description: 'Služba je připravena přijímat produkční provoz' } },
+        },
+      },
       '/v1/system/pause': {
         post: {
           summary: 'Nouzový vypínač (Kill Switch / Emergency Pause)',
@@ -638,6 +757,48 @@ export function generateOpenApi31Spec() {
         post: {
           summary: 'Generátor připnutých DM trigger komentářů pro YouTube, TikTok a Reels',
           responses: { '200': { description: 'Pinned Comment Pack vygenerován' } },
+        },
+      },
+      '/v1/infra/overview': {
+        get: {
+          summary: 'Přehled Fal Media Infrastructure (1 542+ modelů, Serverless, GPU Compute, Workflows, LoRA, MCP)',
+          responses: { '200': { description: 'Kompletní stav infrastrukturní vrstvy' } },
+        },
+      },
+      '/v1/infra/models/run': {
+        post: {
+          summary: 'Sjednocené Model API (GPT Image 2.6, FLUX 3, H3 Max, Seedance 2.5, Meshy 7.1, audio) s fal Inference Engine™',
+          responses: { '201': { description: 'Výstup vygenerován s metrikami zrychlení' } },
+        },
+      },
+      '/v1/infra/serverless/deploy': {
+        post: {
+          summary: '1-Click Serverless nasazení soukromých vah a LoRA adaptérů',
+          responses: { '201': { description: 'Zabezpečený serverless endpoint aktivní' } },
+        },
+      },
+      '/v1/infra/compute/instances': {
+        post: {
+          summary: 'Pronájem dedikovaného GPU klastru (RTX, H100, H200, B200, B300)',
+          responses: { '201': { description: 'GPU instance spuštěna' } },
+        },
+      },
+      '/v1/infra/agent/plan': {
+        post: {
+          summary: 'fal Agent: automatické sestavení a spuštění multi-modálního DAG workflow',
+          responses: { '201': { description: 'Workflow naplánován a spuštěn' } },
+        },
+      },
+      '/v1/infra/training/jobs': {
+        post: {
+          summary: 'Spuštění tréninku vlastního LoRA adaptéru na dedikovaném GPU',
+          responses: { '201': { description: 'LoRA trénink spuštěn' } },
+        },
+      },
+      '/v1/infra/mcp/manifest': {
+        get: {
+          summary: 'Model Context Protocol (MCP) manifest nástrojů pro Genmedia integrace',
+          responses: { '200': { description: 'MCP tool definice' } },
         },
       },
     },

@@ -152,14 +152,53 @@ export class AgentOrchestrator {
       });
     }
 
-    const isMoneyGoal = !isVideoGoal && isExplicitMoneyGoal;
-    const isAffiliateGoal = !isVideoGoal && isExplicitAffiliateGoal;
-    const isBoardroomGoal = !isVideoGoal && isExplicitBoardroomGoal;
-    const isCommentGoal = !isVideoGoal && isExplicitCommentGoal;
+    const isTitanCoreGoal =
+      inputLower.includes('madlipz') ||
+      inputLower.includes('titancore') ||
+      inputLower.includes('dabing') ||
+      inputLower.includes('ypp');
+    const isInfraGoal =
+      !isTitanCoreGoal &&
+      (inputLower.includes('flux 3') ||
+        inputLower.includes('gpt image') ||
+        inputLower.includes('h3 max') ||
+        inputLower.includes('meshy') ||
+        inputLower.includes('serverless') ||
+        inputLower.includes('h100') ||
+        inputLower.includes('h200') ||
+        inputLower.includes('b200') ||
+        inputLower.includes('b300') ||
+        inputLower.includes('lora') ||
+        inputLower.includes('genmedia') ||
+        inputLower.includes('fal agent') ||
+        inputLower.includes('inference engine'));
+    const isMoneyGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitMoneyGoal;
+    const isAffiliateGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitAffiliateGoal;
+    const isBoardroomGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitBoardroomGoal;
+    const isCommentGoal = !isVideoGoal && !isTitanCoreGoal && !isInfraGoal && isExplicitCommentGoal;
 
     const toolsToCall: Array<{ name: string; args: any; idempotencyKey?: string }> = [];
 
-    if (isVideoGoal && needsClarification) {
+    if (isTitanCoreGoal) {
+      toolsToCall.push({
+        name: 'run_titancore_madlipz',
+        args: {
+          visualDescription: params.userMessage,
+          durationSec: 15,
+          seriesName: 'MadLipz CZ Série',
+          episodeNumber: 1,
+        },
+        idempotencyKey: `titancore-${runId}`,
+      });
+    } else if (isInfraGoal) {
+      toolsToCall.push({
+        name: 'run_fal_agent_workflow',
+        args: {
+          goal: params.userMessage,
+        },
+        idempotencyKey: `fal-infra-${runId}`,
+      });
+    } else if (isVideoGoal && needsClarification) {
       // Do NOT render blindly yet; inspect existing vault + save partial brief for seamless next-turn merge
       if (directorAnalysis?.clarification) {
         db.videoBriefDrafts.set(params.threadId, directorAnalysis.clarification.partialBrief);
@@ -284,6 +323,10 @@ export class AgentOrchestrator {
       const execResult = await ToolExecutor.executeTool(toolReq.name, toolReq.args, {
         idempotencyKey: toolReq.idempotencyKey,
         dryRun: params.dryRun,
+        timeoutMs:
+          toolReq.name === 'render_video_mp4' || toolReq.name === 'run_titancore_madlipz'
+            ? 30000
+            : undefined,
       });
 
       if (execResult.success && execResult.result?.asset) {
@@ -352,6 +395,7 @@ export class AgentOrchestrator {
           {
             idempotencyKey,
             dryRun: params.dryRun,
+            timeoutMs: 30000,
           }
         );
 
@@ -388,7 +432,39 @@ export class AgentOrchestrator {
     let replyText = '';
     let suggestions: string[] = [];
 
-    if (isVideoGoal && needsClarification && directorAnalysis?.clarification) {
+    if (isTitanCoreGoal) {
+      const tcToolOut = toolEvents.find((t) => t.tool === 'run_titancore_madlipz')?.output;
+      const tcManifest = tcToolOut?.manifest;
+      if (tcManifest) {
+        replyText = `Vygeneroval jsem GODMODE-TITANCORE MadLipz CZ manifest pro sérii "${tcManifest.series_name}" (stopáž ${tcManifest.target_duration_sec} s, YPP skóre ${tcManifest.ypp_score}/100, Self-Healing iterací: ${tcManifest.healing_iterations}, engine ${tcManifest.engine_used}). Původní audio je označeno k odstranění a titulky jsou připraveny v Safe Zone y=1320.`;
+        suggestions = tcManifest.next_commands.slice(0, 6);
+      } else {
+        replyText = 'Spustil jsem GODMODE-TITANCORE + MadLipz CZ YPP jádro a zkontroloval soulad s monetizací.';
+        suggestions = [
+          'Zkrátit na 15 s',
+          'Přepnout humor na suchý sarkasmus',
+          'Vygenerovat 2. díl série',
+          'Spustit MoviePy YPP Render',
+          'Otestovat A/B Hook',
+          'Spustit 3-kolovou debatu 16 agentů nad scénářem',
+        ];
+      }
+    } else if (isInfraGoal) {
+      const wfOut = toolEvents.find((t) => t.tool === 'run_fal_agent_workflow')?.output?.workflowRun;
+      if (wfOut) {
+        replyText = `fal Agent sestavil a spustil ${wfOut.steps.length}krokový workflow přes fal Inference Engine™ (${wfOut.speedupFactor}× zrychlení, celková latence ${wfOut.totalLatencyMs} ms, SLA 99.99 %). Výstupy jsou připravené v sekci Fal Cloud.`;
+      } else {
+        replyText = 'Spustil jsem infrastrukturní pipeline přes Model APIs a fal Inference Engine™.';
+      }
+      suggestions = [
+        'Otevřít záložku Fal Cloud & GPU Compute',
+        'Nasadit vlastní váhy na Serverless endpoint',
+        'Pronajmout dedikovaný B300 GPU cluster',
+        'Spustit trénink vlastního LoRA adaptéru',
+        'Vygenerovat 3D mesh v Meshy 7.1',
+        'Otestovat Genmedia CLI a MCP nástroje',
+      ];
+    } else if (isVideoGoal && needsClarification && directorAnalysis?.clarification) {
       const clar = directorAnalysis.clarification;
       const knownTopic = clar.partialBrief.topic
         ? `Zachytil jsem téma "${clar.partialBrief.topic}", ale pro špičkový výsledek bez obecné vaty potřebuji upřesnit pár detailů:`

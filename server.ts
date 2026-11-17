@@ -6,6 +6,7 @@
 import express, { Request, Response } from 'express';
 import fs from 'node:fs';
 import path from 'path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { db } from './src/server/db.ts';
@@ -14,6 +15,21 @@ import { AgentOrchestrator } from './src/server/runtime/orchestrator.ts';
 import { BoardroomEngine } from './src/server/boardroom.ts';
 import { MoviePyCompiler } from './src/server/runtime/moviepy.ts';
 import { VideoDirectorEngine } from './src/server/runtime/videoDirector.ts';
+import { TracerService } from './src/server/runtime/tracer.ts';
+import { buildNextCommands, runTitanCoreMadLipz } from './src/engines/titancore_madlipz.ts';
+import {
+  buildAgentWorkflowPlan,
+  buildSdkAndCliSnippets,
+  createComputeInstanceRecord,
+  createLoraTrainingJobRecord,
+  createServerlessEndpointRecord,
+  executeInfraWorkflow,
+  getFalCatalog,
+  GPU_OFFERINGS,
+  MCP_TOOLS,
+  PRESET_INFRA_WORKFLOWS,
+  runFalUnifiedInference,
+} from './src/engines/fal_infrastructure.ts';
 import {
   MediaRenderer,
   inspectMp4Atoms,
@@ -61,6 +77,7 @@ import {
 } from './src/server/runtime/commentIntelligence.ts';
 import {
   CommentReplyStrategy,
+  FactoryAsset,
   RolePermission,
   SocialComment,
   StructuredVideoPrompt,
@@ -75,6 +92,12 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isTestMode =
+  process.env.NODE_ENV === 'test' ||
+  process.env.NEXUS_SKIP_LISTEN === '1' ||
+  Boolean(process.env.NODE_TEST_CONTEXT) ||
+  process.execArgv.some((arg) => arg.includes('test')) ||
+  process.argv.some((arg) => arg === '--test' || arg.includes('.test.'));
 
 function checkActorPermission(req: Request, res: Response, permission: RolePermission): boolean {
   const headerActorId = req.headers['x-nexus-actor-id'] as string | undefined;
@@ -103,7 +126,31 @@ function ensureSystemActive(res: Response): boolean {
   return true;
 }
 
+app.disable('x-powered-by');
 app.use(express.json({ limit: '5mb' }));
+app.use((err: any, _req: Request, res: Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: 'Neplatný JSON formát požadavku.' });
+  }
+  return next(err);
+});
+
+app.use((req: Request, res: Response, next: express.NextFunction) => {
+  const reqId = (req.headers['x-request-id'] as string) || `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  res.setHeader('X-Request-Id', reqId);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+
+  if (!isTestMode && req.method !== 'GET' && req.method !== 'HEAD') {
+    res.on('finish', () => {
+      if (res.statusCode < 500) {
+        db.schedulePersist();
+      }
+    });
+  }
+  next();
+});
 
 // 1. OpenAPI 3.1 & Interactive Docs
 app.get('/openapi.json', (req: Request, res: Response) => {
@@ -132,7 +179,7 @@ app.get('/docs', (req: Request, res: Response) => {
   res.send(html);
 });
 
-// 2. Health & System Pause
+// 2. Health, Readiness & System Pause
 app.get('/healthz', (req: Request, res: Response) => {
   res.json({
     status: db.isSystemPaused ? 'paused' : 'healthy',
@@ -140,6 +187,17 @@ app.get('/healthz', (req: Request, res: Response) => {
     uptimeSeconds: Math.round(process.uptime()),
     agentsCount: db.agents.length,
     opportunitiesCount: db.opportunities.length,
+  });
+});
+
+app.get('/readyz', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ready',
+    environment: process.env.NODE_ENV || 'development',
+    uptimeSeconds: Math.round(process.uptime()),
+    mediaStorageRoot: STORAGE_ROOT,
+    assetsCount: db.factoryAssets.length,
+    endpointsCount: db.serverlessEndpoints.length,
   });
 });
 
@@ -477,9 +535,24 @@ function pipeFileSafely(
 }
 
 app.get('/v1/factory/assets', (req: Request, res: Response) => {
-  const sorted = [...db.factoryAssets].sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
+  const sorted = [...db.factoryAssets]
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    .map((asset) => ({
+      ...asset,
+      yppScore: asset.yppScore ?? asset.titanCoreManifest?.ypp_score ?? (asset.line === 'video' ? 92 : undefined),
+      renderStatus: asset.renderStatus ?? asset.status ?? 'ready',
+      openSourceGenPrompt:
+        asset.openSourceGenPrompt ?? asset.titanCoreManifest?.asset_bridge?.opensourcegen_prompt,
+      agnesManifest: asset.agnesManifest ?? asset.titanCoreManifest?.asset_bridge?.agnes_manifest,
+      nextCommands:
+        asset.nextCommands ??
+        asset.titanCoreManifest?.next_commands ??
+        buildNextCommands({
+          series_name: asset.title,
+          episode_number: 1,
+          target_duration_sec: Math.max(10, Math.min(25, asset.durationSec || 15)),
+        }),
+    }));
   res.json(sorted);
 });
 
@@ -868,6 +941,257 @@ app.post('/api/v1/assets/render', async (req: Request, res: Response) => {
 app.post('/v1/factory/generations', async (req: Request, res: Response) => {
   if (!checkActorPermission(req, res, 'create_edit_videos')) return;
   if (!ensureSystemActive(res)) return;
+
+  const isTitanCoreRequest =
+    typeof req.body?.visualDescription === 'string' || req.body?.line === 'titancore';
+
+  if (isTitanCoreRequest) {
+    const visualDescription = String(req.body?.visualDescription || req.body?.topic || '').trim();
+    if (!visualDescription) {
+      return res.status(400).json({
+        error: 'Parametr visualDescription je povinný.',
+        next_commands: buildNextCommands({
+          series_name: 'MadLipz CZ Série',
+          episode_number: 1,
+          target_duration_sec: 15,
+        }),
+      });
+    }
+
+    const rawDuration = Number(req.body?.durationSec ?? 15);
+    const durationSec = Number.isFinite(rawDuration)
+      ? Math.max(10, Math.min(25, rawDuration))
+      : 15;
+    const seriesName = String(req.body?.seriesName || 'MadLipz CZ Série').trim() || 'MadLipz CZ Série';
+    const episodeNumber = Math.max(1, Number(req.body?.episodeNumber || 1) || 1);
+    const humorStyle =
+      typeof req.body?.humorStyle === 'string' && req.body.humorStyle.trim()
+        ? req.body.humorStyle.trim()
+        : undefined;
+    const rawVideoPath =
+      typeof req.body?.rawVideoPath === 'string' && req.body.rawVideoPath.trim()
+        ? req.body.rawVideoPath.trim()
+        : undefined;
+    const dubAudioPath =
+      typeof req.body?.dubAudioPath === 'string' && req.body.dubAudioPath.trim()
+        ? req.body.dubAudioPath.trim()
+        : undefined;
+    const threadId =
+      typeof req.body?.threadId === 'string' && req.body.threadId.trim()
+        ? req.body.threadId.trim()
+        : 'th-main-001';
+    const dryRun = Boolean(req.body?.dryRun);
+
+    const runId = `run-tc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const tracer = new TracerService(runId, threadId, `TitanCore MadLipz CZ: ${seriesName}`);
+
+    try {
+      const endRouterSpan = tracer.startSpan('titancore_multi_engine_router');
+      const tcStart = Date.now();
+      const tcResult = await runTitanCoreMadLipz({
+        visualDescription,
+        durationSec,
+        seriesName,
+        episodeNumber,
+        humorStyle,
+        rawVideoPath,
+        dubAudioPath,
+      });
+      const tcDuration = Date.now() - tcStart;
+      endRouterSpan(tcResult.traceMeta.healingIterations > 0 ? 'repaired' : 'ok', {
+        engineUsed: tcResult.manifest.engine_used,
+        healingIterations: tcResult.traceMeta.healingIterations,
+        yppScore: tcResult.manifest.ypp_score,
+        engineHistory: tcResult.traceMeta.engineHistory,
+      });
+
+      const endAuditSpan = tracer.startSpan('critic_ypp_audit');
+      endAuditSpan(tcResult.audit.passed ? 'ok' : 'error', {
+        passed: tcResult.audit.passed,
+        issues: tcResult.audit.issues,
+      });
+
+      tracer.recordTokens(tcResult.traceMeta.promptTokens, tcResult.traceMeta.completionTokens);
+      tracer.recordToolCall(
+        'run_titancore_madlipz',
+        { visualDescription, durationSec, seriesName, episodeNumber },
+        {
+          ypp_score: tcResult.manifest.ypp_score,
+          healing_iterations: tcResult.manifest.healing_iterations,
+          engine_used: tcResult.manifest.engine_used,
+        },
+        tcDuration
+      );
+
+      tracer.finish({
+        goalFulfilled: tcResult.audit.passed,
+        concreteness: true,
+        riskAwareness: tcResult.manifest.ypp_score >= 92,
+        noFictitiousMoney: true,
+        repaired: tcResult.traceMeta.healingIterations > 0,
+      });
+
+      const assetId = `asset-tc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+      const tmpDir = path.resolve(process.cwd(), 'tmp');
+      await fs.promises.mkdir(tmpDir, { recursive: true });
+      const manifestPath = path.join(tmpDir, `titancore-${assetId}.json`);
+      await fs.promises.writeFile(manifestPath, JSON.stringify(tcResult.manifest, null, 2), 'utf-8');
+
+      const mp4FilePath = MediaRenderer.getAssetFilePath(threadId, assetId);
+      await fs.promises.mkdir(path.dirname(mp4FilePath), { recursive: true });
+      const posterPath = MediaRenderer.getPosterFilePath(threadId, assetId);
+
+      const newAsset: FactoryAsset = {
+        id: assetId,
+        threadId,
+        line: 'video',
+        title: tcResult.manifest.youtube_metadata.title,
+        prompt: visualDescription,
+        body: tcResult.manifest.blocks
+          .map((b) => `[${b.start_sec.toFixed(1)}s–${b.end_sec.toFixed(1)}s | ${b.role}] ${b.voiceover_cz}`)
+          .join('\n'),
+        meta: `TitanCore MadLipz CZ · YPP ${tcResult.manifest.ypp_score}/100 · ${tcResult.manifest.target_duration_sec}s · ${tcResult.manifest.engine_used}`,
+        tags: tcResult.manifest.youtube_metadata.tags,
+        status: 'rendering',
+        renderStatus: 'rendering',
+        progressPercent: 30,
+        progressStage: 'rendering_ffmpeg',
+        workerMessage: 'MoviePy 2.x YPP-safe pipeline renderuje MP4...',
+        filePath: mp4FilePath,
+        mimeType: 'video/mp4',
+        durationSec: tcResult.manifest.target_duration_sec,
+        resolution: tcResult.manifest.delivery.resolution,
+        faststartVerified: false,
+        streamUrl: `/api/v1/assets/${assetId}/stream`,
+        downloadUrl: `/api/v1/assets/${assetId}/download`,
+        posterUrl: `/api/v1/assets/${assetId}/stream?format=poster`,
+        yppScore: tcResult.manifest.ypp_score,
+        healingIterations: tcResult.manifest.healing_iterations,
+        manifestPath,
+        runId,
+        openSourceGenPrompt: tcResult.manifest.asset_bridge.opensourcegen_prompt,
+        agnesManifest: tcResult.manifest.asset_bridge.agnes_manifest,
+        titanCoreManifest: tcResult.manifest,
+        nextCommands: tcResult.manifest.next_commands,
+        createdAt: new Date().toISOString(),
+      };
+
+      db.factoryAssets.unshift(newAsset);
+
+      db.activities.unshift({
+        id: `act-${Date.now()}-tc`,
+        title: `TitanCore MadLipz CZ: ${tcResult.manifest.series_name} #${tcResult.manifest.episode_number}`,
+        description: `YPP skóre ${tcResult.manifest.ypp_score}/100 · Self-Healing iterací: ${tcResult.manifest.healing_iterations} · Engine: ${tcResult.manifest.engine_used}`,
+        agent: 'Video Agent',
+        timestamp: new Date().toISOString(),
+        type: 'action',
+      });
+
+      const scriptPath = path.resolve(process.cwd(), 'scripts', 'render_ypp_safe.py');
+      const spawnArgs = [scriptPath, '--manifest', manifestPath, '--output', mp4FilePath];
+      if (!rawVideoPath || dryRun || isTestMode) {
+        spawnArgs.push('--mock');
+      }
+      if (rawVideoPath) {
+        spawnArgs.push('--raw-video', rawVideoPath);
+      }
+      if (dubAudioPath) {
+        spawnArgs.push('--dub-audio', dubAudioPath);
+      }
+
+      const child = spawn('python3', spawnArgs, {
+        cwd: process.cwd(),
+        detached: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stderrTail = '';
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderrTail = (stderrTail + chunk.toString('utf-8')).slice(-600);
+      });
+
+      child.on('close', async (code) => {
+        if (code === 0 && fs.existsSync(mp4FilePath)) {
+          try {
+            const atomCheck = inspectMp4Atoms(mp4FilePath);
+            if (!atomCheck.moovBeforeMdat) {
+              await MediaRenderer.ensureFaststartMp4(mp4FilePath);
+            }
+            const checksum = MediaRenderer.computeFileChecksum(mp4FilePath);
+            await MediaRenderer.ensurePosterFile(mp4FilePath, posterPath);
+            newAsset.sizeBytes = checksum.sizeBytes;
+            newAsset.sha256 = checksum.sha256;
+            newAsset.faststartVerified = true;
+            newAsset.status = 'ready';
+            newAsset.renderStatus = 'ready';
+            newAsset.progressPercent = 100;
+            newAsset.progressStage = 'ready';
+            newAsset.workerMessage = 'MoviePy 2.x YPP-safe MP4 připraveno (-movflags +faststart ověřeno).';
+            return;
+          } catch {
+            // Fall through to failed status
+          }
+        }
+        newAsset.status = 'failed';
+        newAsset.renderStatus = 'failed';
+        newAsset.progressPercent = 0;
+        newAsset.progressStage = 'failed';
+        newAsset.workerMessage = `MoviePy render selhal (exit ${code}): ${stderrTail || 'neznámá chyba'}`;
+      });
+
+      child.on('error', (spawnErr) => {
+        newAsset.status = 'failed';
+        newAsset.renderStatus = 'failed';
+        newAsset.progressPercent = 0;
+        newAsset.progressStage = 'failed';
+        newAsset.workerMessage = `Nelze spustit python3 worker: ${spawnErr.message}`;
+      });
+
+      child.unref();
+      (child.stdout as unknown as { unref?: () => void })?.unref?.();
+      (child.stderr as unknown as { unref?: () => void })?.unref?.();
+
+      return res.status(201).json({
+        status: 'ok',
+        runId,
+        traceUrl: `/v1/runs/${runId}`,
+        manifestPath,
+        manifest: tcResult.manifest,
+        audit: tcResult.audit,
+        ypp_score: tcResult.manifest.ypp_score,
+        healing_iterations: tcResult.manifest.healing_iterations,
+        next_commands: tcResult.manifest.next_commands,
+        asset_bridge: tcResult.manifest.asset_bridge,
+        asset: newAsset,
+        items: [
+          {
+            title: tcResult.manifest.youtube_metadata.title,
+            body: tcResult.manifest.youtube_metadata.description,
+            meta: `YPP ${tcResult.manifest.ypp_score}/100 · ${tcResult.manifest.target_duration_sec}s · Healing: ${tcResult.manifest.healing_iterations}`,
+          },
+        ],
+      });
+    } catch (err: any) {
+      tracer.finish({
+        goalFulfilled: false,
+        concreteness: true,
+        riskAwareness: true,
+        noFictitiousMoney: true,
+        repaired: false,
+      });
+      return res.status(500).json({
+        error: `TitanCore generování selhalo: ${err.message}`,
+        runId,
+        traceUrl: `/v1/runs/${runId}`,
+        next_commands: buildNextCommands({
+          series_name: seriesName,
+          episode_number: episodeNumber,
+          target_duration_sec: durationSec,
+        }),
+      });
+    }
+  }
+
   const {
     line,
     topic,
@@ -887,13 +1211,32 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
     async?: boolean;
     structuredPrompt?: StructuredVideoPrompt;
   };
-  if (!line || !topic) return res.status(400).json({ error: 'Line i topic jsou povinné.' });
+  if (!line || !topic) {
+    return res.status(400).json({
+      error: 'Line i topic jsou povinné.',
+      next_commands: buildNextCommands({
+        series_name: 'NEXUS Video Série',
+        episode_number: 1,
+        target_duration_sec: 15,
+      }),
+    });
+  }
 
   const template = templateId
     ? db.userTemplates.find((t) => t.id === templateId)
     : undefined;
 
+  const fallbackCommands = buildNextCommands({
+    series_name: topic.slice(0, 40),
+    episode_number: 1,
+    target_duration_sec: 15,
+  });
+
+  const stdRunId = `run-fac-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const stdTracer = new TracerService(stdRunId, threadId, `Factory ${line}: ${topic.slice(0, 60)}`);
+
   if (line === 'video') {
+    const endPlanSpan = stdTracer.startSpan('factory_video_storyboard');
     const aspectRatio: '9:16' | '16:9' =
       structuredPrompt?.aspectRatio || (format === '16:9' ? '16:9' : '9:16');
     const assetId = `asset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
@@ -921,6 +1264,7 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
       structuredPrompt: brief.structuredPrompt,
       dryRun: Boolean(dryRun),
     });
+    pendingAsset.nextCommands = fallbackCommands;
     db.factoryAssets.unshift(pendingAsset);
 
     if (isAsync) {
@@ -934,12 +1278,29 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
         topic,
         dryRun: Boolean(dryRun),
       });
+      endPlanSpan('ok', { mode: 'async_202', assetId, aspectRatio });
+      stdTracer.recordTokens(280, 390);
+      stdTracer.recordToolCall(
+        'factory_enqueue_video',
+        { line, topic, aspectRatio, async: true },
+        { assetId, status: 'accepted' },
+        15
+      );
+      stdTracer.finish({
+        goalFulfilled: true,
+        concreteness: true,
+        riskAwareness: true,
+        noFictitiousMoney: true,
+        repaired: false,
+      });
       res.setHeader('Retry-After', '1');
       res.setHeader('Cache-Control', 'no-store');
       return res.status(202).json({
         status: 'accepted',
         statusCode: 202,
         retryAfterSeconds: 1,
+        runId: stdRunId,
+        traceUrl: `/v1/runs/${stdRunId}`,
         items: [
           {
             title: storyboard.title,
@@ -958,6 +1319,7 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
         },
         storyboard,
         moviePyScript,
+        next_commands: fallbackCommands,
       });
     }
 
@@ -972,8 +1334,25 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
         topic,
         dryRun: Boolean(dryRun),
       });
+      endPlanSpan('ok', { mode: 'sync_200', assetId, faststartVerified: Boolean(result.asset.faststartVerified) });
+      stdTracer.recordTokens(320, 440);
+      stdTracer.recordToolCall(
+        'factory_render_video',
+        { line, topic, aspectRatio },
+        { assetId, durationSec: result.asset.durationSec },
+        40
+      );
+      stdTracer.finish({
+        goalFulfilled: true,
+        concreteness: true,
+        riskAwareness: true,
+        noFictitiousMoney: true,
+        repaired: false,
+      });
 
       return res.json({
+        runId: stdRunId,
+        traceUrl: `/v1/runs/${stdRunId}`,
         items: [
           {
             title: storyboard.title,
@@ -988,11 +1367,26 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
         faststartVerified: Boolean(result.asset.faststartVerified),
         storyboard,
         moviePyScript,
+        next_commands: fallbackCommands,
       });
     } catch (err: any) {
-      return res.status(500).json({ error: `Chyba při renderu MP4: ${err.message}` });
+      endPlanSpan('error', { error: err?.message });
+      stdTracer.finish({
+        goalFulfilled: false,
+        concreteness: true,
+        riskAwareness: true,
+        noFictitiousMoney: true,
+        repaired: false,
+      });
+      return res.status(500).json({
+        error: `Chyba při renderu MP4: ${err.message}`,
+        runId: stdRunId,
+        traceUrl: `/v1/runs/${stdRunId}`,
+        next_commands: fallbackCommands,
+      });
     }
   } else if (line === 'ad') {
+    const endAdSpan = stdTracer.startSpan('factory_ad_creative');
     const asset = {
       id: `asset-${Date.now().toString(36)}`,
       threadId,
@@ -1002,14 +1396,29 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
       meta: 'Meta Ads & YouTube In-Stream, 3 hook varianty',
       tags: ['Meta Ads', 'Konverze', 'PPC'],
       status: 'ready' as const,
+      runId: stdRunId,
+      nextCommands: fallbackCommands,
       createdAt: new Date().toISOString(),
     };
     db.factoryAssets.unshift(asset);
+    endAdSpan('ok', { assetId: asset.id });
+    stdTracer.recordTokens(210, 310);
+    stdTracer.finish({
+      goalFulfilled: true,
+      concreteness: true,
+      riskAwareness: true,
+      noFictitiousMoney: true,
+      repaired: false,
+    });
     return res.json({
+      runId: stdRunId,
+      traceUrl: `/v1/runs/${stdRunId}`,
       items: [{ title: asset.title, body: asset.body, meta: asset.meta }],
       asset,
+      next_commands: fallbackCommands,
     });
   } else {
+    const endFunnelSpan = stdTracer.startSpan('factory_funnel_blueprint');
     const asset = {
       id: `asset-${Date.now().toString(36)}`,
       threadId,
@@ -1019,12 +1428,26 @@ app.post('/v1/factory/generations', async (req: Request, res: Response) => {
       meta: 'Landing Page Architecture, odhadovaná konverze 26%',
       tags: ['Funnel', 'Landing Page', 'Lead Magnet'],
       status: 'ready' as const,
+      runId: stdRunId,
+      nextCommands: fallbackCommands,
       createdAt: new Date().toISOString(),
     };
     db.factoryAssets.unshift(asset);
+    endFunnelSpan('ok', { assetId: asset.id });
+    stdTracer.recordTokens(220, 320);
+    stdTracer.finish({
+      goalFulfilled: true,
+      concreteness: true,
+      riskAwareness: true,
+      noFictitiousMoney: true,
+      repaired: false,
+    });
     return res.json({
+      runId: stdRunId,
+      traceUrl: `/v1/runs/${stdRunId}`,
       items: [{ title: asset.title, body: asset.body, meta: asset.meta }],
       asset,
+      next_commands: fallbackCommands,
     });
   }
 });
@@ -2345,6 +2768,436 @@ app.patch('/v1/comments/config', (req: Request, res: Response) => {
   res.json({ config: db.commentAutopilotConfig });
 });
 
+// 13. Fal Media Infrastructure Layer (Model APIs 1500+, Inference Engine™, Serverless, Compute GPU, Workflows, LoRA Training, CLI & MCP)
+app.get('/v1/infra/overview', (req: Request, res: Response) => {
+  const query = typeof req.query.query === 'string' ? req.query.query : undefined;
+  const modality = (typeof req.query.modality === 'string' ? req.query.modality : 'all') as
+    | 'all'
+    | 'image'
+    | 'video'
+    | '3d'
+    | 'audio';
+  const catalog = getFalCatalog({ query, modality, limit: 48 });
+  return res.json({
+    summary: catalog.summary,
+    models: catalog.models,
+    recentRuns: db.falInferenceRuns.slice(0, 20),
+    endpoints: db.serverlessEndpoints,
+    gpuOfferings: GPU_OFFERINGS,
+    gpuInstances: db.computeGpuInstances,
+    presetWorkflows: PRESET_INFRA_WORKFLOWS,
+    workflowRuns: db.infraWorkflowRuns.slice(0, 15),
+    trainingJobs: db.loraTrainingJobs,
+    mcpTools: MCP_TOOLS,
+  });
+});
+
+app.get('/v1/infra/models', (req: Request, res: Response) => {
+  const query = typeof req.query.query === 'string' ? req.query.query : undefined;
+  const modality = (typeof req.query.modality === 'string' ? req.query.modality : 'all') as
+    | 'all'
+    | 'image'
+    | 'video'
+    | '3d'
+    | 'audio';
+  const limit = req.query.limit ? Number(req.query.limit) : 48;
+  return res.json(getFalCatalog({ query, modality, limit }));
+});
+
+app.post('/v1/infra/models/run', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const run = await runFalUnifiedInference(req.body || {});
+    db.falInferenceRuns.unshift(run);
+    db.activities.unshift({
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      title: `Model API: ${run.modelName} (${run.speedupFactor}×)`,
+      description: `${run.actualLatencyMs} ms · ${run.outputSummary}`,
+      agent: 'CTO Agent',
+      timestamp: new Date().toISOString(),
+      type: 'action',
+    });
+    return res.status(201).json({
+      run,
+      snippets: buildSdkAndCliSnippets(run.modelId, run.prompt),
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Neplatný požadavek na Model API.' });
+  }
+});
+
+app.get('/v1/infra/serverless', (_req: Request, res: Response) => {
+  return res.json({ endpoints: db.serverlessEndpoints });
+});
+
+app.post('/v1/infra/serverless/deploy', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const endpoint = createServerlessEndpointRecord(req.body || {});
+    db.serverlessEndpoints.unshift(endpoint);
+    db.activities.unshift({
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      title: `Serverless 1-Click Deploy: ${endpoint.name}`,
+      description: `${endpoint.endpointUrl} (${endpoint.gpuProfile}, cold start ${endpoint.coldStartMs} ms)`,
+      agent: 'Automation Agent',
+      timestamp: new Date().toISOString(),
+      type: 'action',
+    });
+    return res.status(201).json({ endpoint });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Neplatná konfigurace Serverless endpointu.' });
+  }
+});
+
+app.post('/v1/infra/serverless/:id/invoke', async (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  const endpoint = db.serverlessEndpoints.find((e) => e.id === req.params.id);
+  if (!endpoint) {
+    return res.status(404).json({ error: 'Serverless endpoint nebyl nalezen.' });
+  }
+  if (endpoint.status === 'paused') {
+    return res.status(409).json({ error: 'Endpoint je pozastaven. Nejprve ho aktivujte.' });
+  }
+  try {
+    const prompt = String(req.body?.prompt || `Testovací požadavek na ${endpoint.name}`);
+    const run = await runFalUnifiedInference({
+      modelId: endpoint.baseModel,
+      prompt,
+      aspectRatio: '16:9',
+      inferenceEngineAccelerated: true,
+      loraUrl: endpoint.weightsSourceUrl,
+    });
+    endpoint.status = 'ready';
+    endpoint.requestsCount += 1;
+    endpoint.avgLatencyMs = Math.round((endpoint.avgLatencyMs + run.actualLatencyMs) / 2);
+    endpoint.updatedAt = new Date().toISOString();
+    db.falInferenceRuns.unshift(run);
+    return res.json({ endpoint, run });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Volání endpointu selhalo.' });
+  }
+});
+
+app.patch('/v1/infra/serverless/:id', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const endpoint = db.serverlessEndpoints.find((e) => e.id === req.params.id);
+  if (!endpoint) {
+    return res.status(404).json({ error: 'Serverless endpoint nebyl nalezen.' });
+  }
+  const { status } = req.body || {};
+  if (status && ['ready', 'scaled_to_zero', 'paused'].includes(status)) {
+    endpoint.status = status;
+    endpoint.updatedAt = new Date().toISOString();
+  }
+  return res.json({ endpoint });
+});
+
+app.get('/v1/infra/compute', (_req: Request, res: Response) => {
+  return res.json({
+    offerings: GPU_OFFERINGS,
+    instances: db.computeGpuInstances,
+  });
+});
+
+app.post('/v1/infra/compute/instances', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const instance = createComputeInstanceRecord(req.body || {});
+    db.computeGpuInstances.unshift(instance);
+    db.activities.unshift({
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      title: `Compute GPU pronajato: ${instance.gpuCount}× ${instance.gpuName}`,
+      description: `${instance.totalVramGb} GB VRAM · $${instance.hourlyCostUsd}/h · ${instance.region}`,
+      agent: 'CTO Agent',
+      timestamp: new Date().toISOString(),
+      type: 'action',
+    });
+    return res.status(201).json({ instance });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Pronájem GPU selhal.' });
+  }
+});
+
+app.patch('/v1/infra/compute/instances/:id', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const instance = db.computeGpuInstances.find((g) => g.id === req.params.id);
+  if (!instance) {
+    return res.status(404).json({ error: 'GPU instance nebyla nalezena.' });
+  }
+  const { status } = req.body || {};
+  if (status && ['running', 'stopped', 'terminated'].includes(status)) {
+    instance.status = status;
+    if (status !== 'running') {
+      instance.utilizationPercent = 0;
+      instance.vramUsedGb = 0;
+    } else {
+      instance.utilizationPercent = 66;
+      instance.vramUsedGb = Math.round(instance.totalVramGb * 0.48);
+    }
+  }
+  return res.json({ instance });
+});
+
+app.post('/v1/infra/workflows/run', async (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  const { presetId, name, goal, steps, mode = 'workflow' } = req.body || {};
+  const preset = presetId ? PRESET_INFRA_WORKFLOWS.find((w) => w.id === presetId) : undefined;
+  const resolvedSteps = Array.isArray(steps) && steps.length > 0 ? steps : preset?.steps;
+  if (!resolvedSteps || resolvedSteps.length === 0) {
+    return res.status(400).json({ error: 'Zadejte presetId nebo alespoň 1 krok workflow.' });
+  }
+  const run = await executeInfraWorkflow({
+    name: name || preset?.name || 'Vlastní Media Workflow',
+    goal: goal || preset?.description || 'Multi-step generování médií',
+    mode,
+    steps: resolvedSteps,
+  });
+  db.infraWorkflowRuns.unshift(run);
+  return res.status(201).json({ workflowRun: run });
+});
+
+app.post('/v1/infra/agent/plan', async (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  const { goal, execute = true } = req.body || {};
+  if (!goal || typeof goal !== 'string' || goal.trim().length < 3) {
+    return res.status(400).json({ error: 'Parametr goal je povinný (min. 3 znaky).' });
+  }
+  const plan = buildAgentWorkflowPlan(goal.trim());
+  if (!execute) {
+    return res.json({ plan });
+  }
+  const workflowRun = await executeInfraWorkflow({
+    name: plan.name,
+    goal: goal.trim(),
+    mode: 'fal_agent',
+    steps: plan.steps,
+  });
+  db.infraWorkflowRuns.unshift(workflowRun);
+  return res.status(201).json({ plan, workflowRun });
+});
+
+app.get('/v1/infra/training/jobs', (_req: Request, res: Response) => {
+  return res.json({ jobs: db.loraTrainingJobs });
+});
+
+app.post('/v1/infra/training/jobs', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  if (!ensureSystemActive(res)) return;
+  try {
+    const job = createLoraTrainingJobRecord(req.body || {});
+    db.loraTrainingJobs.unshift(job);
+    db.activities.unshift({
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      title: `LoRA Training dokončen: ${job.adapterName}`,
+      description: `Base: ${job.baseModelId} · Trigger: ${job.triggerWord} · Final loss ${job.currentLoss}`,
+      agent: 'Video Agent',
+      timestamp: new Date().toISOString(),
+      type: 'action',
+    });
+    return res.status(201).json({ job });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Konfigurace LoRA tréninku je neplatná.' });
+  }
+});
+
+app.post('/v1/infra/training/jobs/:id/deploy', (req: Request, res: Response) => {
+  if (!checkActorPermission(req, res, 'create_edit_videos')) return;
+  const job = db.loraTrainingJobs.find((j) => j.id === req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Tréninková úloha LoRA nebyla nalezena.' });
+  }
+  const endpoint = createServerlessEndpointRecord({
+    name: `${job.adapterName.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24)}-ep`,
+    baseModel: job.baseModelId,
+    weightsSourceUrl: job.weightsArtifactUrl || `s3://nexus-weights/${job.id}.safetensors`,
+    gpuProfile: job.gpuTier === 'rtx-5090' ? 'rtx-4090' : job.gpuTier,
+    visibility: 'private',
+    minReplicas: 0,
+    maxReplicas: 8,
+    scaleToZeroSec: 90,
+  });
+  db.serverlessEndpoints.unshift(endpoint);
+  job.deployedEndpointId = endpoint.id;
+  return res.status(201).json({ job, endpoint });
+});
+
+app.get('/v1/infra/mcp/manifest', (_req: Request, res: Response) => {
+  return res.json({
+    protocolVersion: '2025-11-05',
+    serverInfo: {
+      name: 'nexus-fal-media-infrastructure',
+      version: '1.0.0',
+    },
+    tools: MCP_TOOLS,
+  });
+});
+
+app.post('/v1/infra/mcp/call', async (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  const { name, arguments: args = {} } = req.body || {};
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ error: 'Parametr name (název MCP toolu) je povinný.' });
+  }
+  try {
+    if (name === 'fal_generate_media') {
+      const run = await runFalUnifiedInference(args);
+      db.falInferenceRuns.unshift(run);
+      return res.json({ content: [{ type: 'text', text: run.outputSummary }], structuredContent: run });
+    }
+    if (name === 'fal_deploy_serverless') {
+      const endpoint = createServerlessEndpointRecord({
+        name: args.name || 'mcp-endpoint',
+        baseModel: args.baseModel || 'fal-ai/flux-3/pro',
+        weightsSourceUrl: args.weightsSourceUrl || 's3://nexus-weights/mcp-lora.safetensors',
+        gpuProfile: args.gpuProfile || 'h100-sxm',
+        visibility: 'private',
+        minReplicas: 0,
+        maxReplicas: 8,
+        scaleToZeroSec: 90,
+      });
+      db.serverlessEndpoints.unshift(endpoint);
+      return res.json({ content: [{ type: 'text', text: `Nasazen endpoint ${endpoint.endpointUrl}` }], structuredContent: endpoint });
+    }
+    if (name === 'fal_provision_gpu') {
+      const instance = createComputeInstanceRecord({
+        gpuId: args.gpuId || 'b200-hgx',
+        gpuCount: args.gpuCount || 1,
+        workload: args.workload || 'lora_training',
+        region: 'eu-central-prague',
+      });
+      db.computeGpuInstances.unshift(instance);
+      return res.json({ content: [{ type: 'text', text: `Pronajato ${instance.gpuCount}× ${instance.gpuName}` }], structuredContent: instance });
+    }
+    if (name === 'fal_run_workflow') {
+      const plan = buildAgentWorkflowPlan(String(args.goal || 'Video kampaň'));
+      const workflowRun = await executeInfraWorkflow({
+        name: plan.name,
+        goal: String(args.goal || 'Video kampaň'),
+        mode: 'fal_agent',
+        steps: plan.steps,
+      });
+      db.infraWorkflowRuns.unshift(workflowRun);
+      return res.json({ content: [{ type: 'text', text: `Workflow ${workflowRun.name} dokončen` }], structuredContent: workflowRun });
+    }
+    if (name === 'fal_train_lora') {
+      const job = createLoraTrainingJobRecord({
+        adapterName: args.adapterName || 'MCP LoRA',
+        baseModelId: args.baseModelId || 'fal-ai/flux-3/pro',
+        triggerWord: args.triggerWord || 'MCPSTYLE',
+        datasetSource: 's3://nexus-datasets/mcp-pack.zip',
+        gpuTier: 'h100-sxm',
+        rank: 32,
+        steps: 1000,
+        learningRate: 0.0002,
+      });
+      db.loraTrainingJobs.unshift(job);
+      return res.json({ content: [{ type: 'text', text: `LoRA ${job.adapterName} natrénována` }], structuredContent: job });
+    }
+    return res.status(404).json({ error: `Neznámý MCP tool "${name}".` });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'MCP volání selhalo.' });
+  }
+});
+
+app.post('/v1/infra/cli/exec', async (req: Request, res: Response) => {
+  if (!ensureSystemActive(res)) return;
+  const command = String(req.body?.command || '').trim();
+  if (!command) {
+    return res.status(400).json({ error: 'Zadejte CLI příkaz (např. "genmedia models list" nebo "genmedia run fal-ai/flux-3/pro --prompt ...").' });
+  }
+  const lower = command.toLowerCase();
+  if (lower.startsWith('mcp tools/list')) {
+    return res.json({
+      exitCode: 0,
+      stdout: MCP_TOOLS.map((t) => `• ${t.name} — ${t.description}`).join('\n'),
+      data: MCP_TOOLS,
+    });
+  }
+  if (lower.startsWith('genmedia models')) {
+    const cat = getFalCatalog({ limit: 8 });
+    return res.json({
+      exitCode: 0,
+      stdout: `Katalog: ${cat.summary.totalModelsCount} produkčních modelů (SLA ${cat.summary.slaUptime}, ${cat.summary.engineName})\n` +
+        cat.models.map((m) => `  ${m.id.padEnd(28)} ${m.modality.toUpperCase().padEnd(6)} ${m.speedupFactor}  ${m.pricePerUnit}`).join('\n'),
+      data: cat,
+    });
+  }
+  if (lower.startsWith('genmedia run')) {
+    const tokens = command.split(/\s+/);
+    const modelId = tokens[2] && !tokens[2].startsWith('--') ? tokens[2] : 'fal-ai/flux-3/pro';
+    const promptMatch = command.match(/--prompt\s+"([^"]+)"|--prompt\s+'([^']+)'|--prompt\s+([^\s]+)/i);
+    const prompt = promptMatch ? promptMatch[1] || promptMatch[2] || promptMatch[3] : 'CLI testovací generace přes fal Inference Engine';
+    const run = await runFalUnifiedInference({ modelId, prompt, inferenceEngineAccelerated: true });
+    db.falInferenceRuns.unshift(run);
+    return res.json({
+      exitCode: 0,
+      stdout: `[${run.id}] ${run.modelName} (${run.speedupFactor}× · ${run.actualLatencyMs} ms)\n${run.outputSummary}`,
+      data: run,
+    });
+  }
+  if (lower.startsWith('genmedia compute rent')) {
+    const gpuMatch = command.match(/--gpu\s+([^\s]+)/i);
+    const countMatch = command.match(/--count\s+(\d+)/i);
+    const gpuId = (gpuMatch?.[1] || 'b300-ultra') as any;
+    const instance = createComputeInstanceRecord({
+      gpuId: ['rtx-4090', 'rtx-5090', 'h100-sxm', 'h200-sxm', 'b200-hgx', 'b300-ultra'].includes(gpuId)
+        ? gpuId
+        : 'b300-ultra',
+      gpuCount: countMatch ? Math.min(8, Math.max(1, Number(countMatch[1]))) : 1,
+      region: 'eu-central-prague',
+      workload: 'lora_training',
+    });
+    db.computeGpuInstances.unshift(instance);
+    return res.json({
+      exitCode: 0,
+      stdout: `[${instance.id}] Pronajato ${instance.gpuCount}× ${instance.gpuName} (${instance.totalVramGb} GB VRAM, $${instance.hourlyCostUsd}/h)\nSSH: ${instance.sshEndpoint}`,
+      data: instance,
+    });
+  }
+  if (lower.startsWith('genmedia deploy')) {
+    const nameMatch = command.match(/--name\s+([^\s]+)/i);
+    const baseMatch = command.match(/--base\s+([^\s]+)/i);
+    const endpoint = createServerlessEndpointRecord({
+      name: nameMatch?.[1] || `cli-ep-${Date.now().toString(36).slice(-4)}`,
+      baseModel: baseMatch?.[1] || 'fal-ai/flux-3/pro',
+      weightsSourceUrl: 's3://nexus-weights/cli-deploy.safetensors',
+      gpuProfile: 'h100-sxm',
+      visibility: 'private',
+      minReplicas: 0,
+      maxReplicas: 8,
+      scaleToZeroSec: 90,
+    });
+    db.serverlessEndpoints.unshift(endpoint);
+    return res.json({
+      exitCode: 0,
+      stdout: `[${endpoint.id}] Serverless endpoint připraven: ${endpoint.endpointUrl} (cold start ${endpoint.coldStartMs} ms)`,
+      data: endpoint,
+    });
+  }
+
+  return res.json({
+    exitCode: 0,
+    stdout: `Dostupné příkazy:\n  genmedia models list\n  genmedia run fal-ai/gpt-image-2.6 --prompt "Pražský hrad za úsvitu"\n  genmedia deploy --name my-lora --base fal-ai/flux-3/pro\n  genmedia compute rent --gpu b300-ultra --count 2\n  mcp tools/list`,
+  });
+});
+
+// API 404 handler so unmatched /v1/* or /api/* routes return JSON instead of SPA HTML
+app.use(['/v1', '/api'], (_req: Request, res: Response) => {
+  return res.status(404).json({ error: 'Požadovaný API endpoint neexistuje.' });
+});
+
+// Structured JSON fallback for uncaught route errors
+app.use((err: any, _req: Request, res: Response, _next: express.NextFunction) => {
+  const statusCode = typeof err?.status === 'number' ? err.status : 500;
+  return res.status(statusCode).json({
+    error: err?.message || 'Interní chyba serveru.',
+  });
+});
+
 // Vite middleware in dev or static files in production
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
@@ -2355,30 +3208,34 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use(express.static(distDir, { maxAge: '1h' }));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[NEXUS X OS] Server running on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[NEXUS X OS] Server running on http://0.0.0.0:${PORT} (${process.env.NODE_ENV || 'development'})`);
     console.log(`[NEXUS X OS] OpenAPI 3.1: http://0.0.0.0:${PORT}/openapi.json`);
     console.log(`[NEXUS X OS] Interactive Docs: http://0.0.0.0:${PORT}/docs`);
   });
-}
 
-const isTestMode =
-  process.env.NODE_ENV === 'test' ||
-  process.env.NEXUS_SKIP_LISTEN === '1' ||
-  Boolean(process.env.NODE_TEST_CONTEXT) ||
-  process.execArgv.some((arg) => arg.includes('test')) ||
-  process.argv.some((arg) => arg === '--test' || arg.includes('.test.'));
+  const gracefulShutdown = (signal: string) => {
+    console.log(`[NEXUS X OS] Received ${signal}, flushing state and shutting down...`);
+    db.persistSync();
+    server.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+}
 
 if (!isTestMode) {
   startServer();
 }
 
 export { app };
-
-

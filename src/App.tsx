@@ -13,6 +13,7 @@ import { MediaVaultView } from './components/MediaVaultView.tsx';
 import { CommentSwarmView } from './components/CommentSwarmView.tsx';
 import { AnalyticsView } from './components/AnalyticsView.tsx';
 import { AccountsTeamView } from './components/AccountsTeamView.tsx';
+import { InfraCloudView } from './components/InfraCloudView.tsx';
 import { PublishModal } from './components/PublishModal.tsx';
 import { TraceDrawer } from './components/TraceDrawer.tsx';
 import { EvalsModal } from './components/EvalsModal.tsx';
@@ -315,6 +316,7 @@ export default function App() {
             onRefreshAssets={refreshAssets}
           />
         )}
+        {activeTab === 'infra' && <InfraCloudView />}
         {activeTab === 'vault' && (
           <MediaVaultView
             assets={assets}

@@ -178,6 +178,15 @@ export interface FactoryAsset {
   videoStoryboard?: VideoStoryboard;
   videoBrief?: VideoCreativeBrief;
   structuredPrompt?: StructuredVideoPrompt;
+  yppScore?: number;
+  healingIterations?: number;
+  renderStatus?: 'queued' | 'rendering' | 'ready' | 'failed';
+  manifestPath?: string;
+  runId?: string;
+  openSourceGenPrompt?: string;
+  agnesManifest?: Record<string, any>;
+  titanCoreManifest?: TitanCoreManifest;
+  nextCommands?: string[];
   createdAt: string;
   updatedAt?: string;
   dryRun?: boolean;
@@ -1025,7 +1034,262 @@ export interface PinnedCommentPack {
   predictedEngagementBoost: string;
 }
 
+// -------------------------------------------------------------
+// GODMODE-TITANCORE + MADLIPZ CZ YPP VIDEO FACTORY TYPES
+// -------------------------------------------------------------
+export type TitanCoreBlockRole = 'hook' | 'setup' | 'escalation' | 'punchline_loop';
 
+export interface TitanCoreBlock {
+  id: string;
+  role: TitanCoreBlockRole;
+  start_sec: number;
+  end_sec: number;
+  voiceover_cz: string;
+  subtitle_text: string;
+  visual_direction: string;
+  audio_cue?: string;
+  words_per_sec?: number;
+}
 
+export interface TitanCoreAgnesManifest {
+  generator: 'agnes-video-generator';
+  version: string;
+  aspect_ratio: '9:16';
+  resolution: '1080x1920';
+  fps: number;
+  language: 'cs-CZ';
+  word_level_subtitles: {
+    enabled: boolean;
+    safe_zone_y: number;
+    font_family: string;
+    highlight_color: string;
+    diacritics_utf8: boolean;
+  };
+  audio_pipeline: {
+    strip_original_audio: boolean;
+    human_dub_dominant: boolean;
+    target_lufs: number;
+  };
+  segments: Array<{
+    id: string;
+    role: TitanCoreBlockRole;
+    start_sec: number;
+    end_sec: number;
+    text: string;
+    visual_prompt: string;
+  }>;
+}
 
+export interface TitanCoreAssetBridge {
+  opensourcegen_prompt: string;
+  opensourcegen_models: string[];
+  agnes_manifest: TitanCoreAgnesManifest;
+}
+
+export interface TitanCoreManifest {
+  pipeline_target: 'wedikcz/video';
+  series_name: string;
+  episode_number: number;
+  humor_angle: string;
+  target_duration_sec: number;
+  ypp_score: number;
+  healing_iterations: number;
+  engine_used: string;
+  blocks: TitanCoreBlock[];
+  delivery: {
+    aspect_ratio: '9:16';
+    resolution: '1080x1920';
+    fps: number;
+    audio_mode: 'original_stripped_human_dub_dominant';
+    anti_fingerprint: {
+      lum_contrast: number;
+      micro_zoom_block_role: 'punchline_loop';
+      color_shift: string;
+    };
+    safe_zone_y: number;
+    raw_video_path?: string;
+    dub_audio_path?: string;
+  };
+  youtube_metadata: {
+    title: string;
+    description: string;
+    tags: string[];
+    category: string;
+    pinned_comment: string;
+  };
+  asset_bridge: TitanCoreAssetBridge;
+  next_commands: string[];
+}
+
+export type TitanCoreAuditIssueCode =
+  | 'HOOK_TIMING'
+  | 'PACING_OVERFLOW'
+  | 'DURATION_MISMATCH'
+  | 'YPP_COMPLIANCE';
+
+export interface TitanCoreAuditIssue {
+  code: TitanCoreAuditIssueCode;
+  blockIndex?: number;
+  detail: string;
+}
+
+export interface TitanCoreAuditResult {
+  passed: boolean;
+  issues: TitanCoreAuditIssue[];
+  diagnosis: string;
+}
+
+// -------------------------------------------------------------
+// FAL MEDIA INFRASTRUCTURE LAYER TYPES (MODEL APIS, SERVERLESS, COMPUTE, ENGINE, WORKFLOWS, TRAINING, CLI/MCP)
+// -------------------------------------------------------------
+export type FalModelModality = 'image' | 'video' | '3d' | 'audio';
+
+export interface FalModelSpec {
+  id: string;
+  name: string;
+  modality: FalModelModality;
+  provider: string;
+  summary: string;
+  speedupFactor: string;
+  baseLatencyMs: number;
+  acceleratedLatencyMs: number;
+  pricePerUnit: string;
+  maxResolutionOrFormat: string;
+  supportsLora: boolean;
+  featured?: boolean;
+  tags: string[];
+}
+
+export interface FalCatalogSummary {
+  totalModelsCount: number;
+  byModality: Record<FalModelModality, number>;
+  slaUptime: string;
+  engineName: string;
+  maxSpeedup: string;
+  liveExternalEnabled: boolean;
+}
+
+export interface FalInferenceRun {
+  id: string;
+  modelId: string;
+  modelName: string;
+  modality: FalModelModality;
+  prompt: string;
+  inferenceEngineAccelerated: boolean;
+  speedupFactor: number;
+  baseLatencyMs: number;
+  actualLatencyMs: number;
+  slaUptime: string;
+  executionMode: 'live-fal-api' | 'nexus-accelerated-local';
+  status: 'completed' | 'failed';
+  outputSummary: string;
+  outputArtifactUrl?: string;
+  outputPreviewSvg?: string;
+  outputMetadata: Record<string, any>;
+  pipelineStages: Array<{ stage: string; durationMs: number }>;
+  createdAt: string;
+}
+
+export type ServerlessEndpointStatus = 'deploying' | 'ready' | 'scaled_to_zero' | 'paused';
+
+export interface ServerlessEndpoint {
+  id: string;
+  name: string;
+  slug: string;
+  endpointUrl: string;
+  baseModel: string;
+  weightsSourceUrl: string;
+  visibility: 'private' | 'team';
+  authTokenMasked: string;
+  gpuProfile: 'rtx-4090' | 'h100-sxm' | 'h200-sxm' | 'b200-hgx' | 'b300-ultra';
+  minReplicas: number;
+  maxReplicas: number;
+  scaleToZeroSec: number;
+  coldStartMs: number;
+  status: ServerlessEndpointStatus;
+  requestsCount: number;
+  avgLatencyMs: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type GpuSeriesId = 'rtx-4090' | 'rtx-5090' | 'h100-sxm' | 'h200-sxm' | 'b200-hgx' | 'b300-ultra';
+
+export interface GpuOfferingSpec {
+  id: GpuSeriesId;
+  family: 'RTX' | 'H100' | 'H200' | 'B200' | 'B300';
+  name: string;
+  vramGb: number;
+  interconnect: string;
+  fp8Tflops: number;
+  hourlyRateUsd: number;
+  availableNodes: number;
+  recommendedFor: string;
+}
+
+export interface ComputeGpuInstance {
+  id: string;
+  name: string;
+  gpuId: GpuSeriesId;
+  gpuName: string;
+  gpuCount: number;
+  totalVramGb: number;
+  region: 'eu-west-frankfurt' | 'us-east-virginia' | 'eu-central-prague';
+  workload: 'inference' | 'lora_training' | 'fine_tuning' | 'custom_container';
+  hourlyCostUsd: number;
+  status: 'provisioning' | 'running' | 'stopped' | 'terminated';
+  utilizationPercent: number;
+  vramUsedGb: number;
+  sshEndpoint: string;
+  apiEndpoint: string;
+  createdAt: string;
+}
+
+export interface InfraWorkflowStep {
+  id: string;
+  label: string;
+  modelId: string;
+  modality: FalModelModality;
+  promptTemplate: string;
+  status?: 'pending' | 'running' | 'completed';
+  latencyMs?: number;
+  outputPreview?: string;
+}
+
+export interface InfraWorkflowRun {
+  id: string;
+  name: string;
+  goal: string;
+  mode: 'workflow' | 'fal_agent' | 'sandbox';
+  status: 'completed' | 'failed';
+  totalLatencyMs: number;
+  speedupFactor: number;
+  steps: InfraWorkflowStep[];
+  createdAt: string;
+}
+
+export interface LoraTrainingJob {
+  id: string;
+  adapterName: string;
+  baseModelId: string;
+  triggerWord: string;
+  datasetSource: string;
+  gpuTier: GpuSeriesId;
+  rank: number;
+  steps: number;
+  completedSteps: number;
+  learningRate: number;
+  currentLoss: number;
+  lossHistory: number[];
+  status: 'queued' | 'training' | 'completed' | 'failed';
+  weightsArtifactUrl?: string;
+  deployedEndpointId?: string;
+  createdAt: string;
+}
+
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, any>;
+}
 

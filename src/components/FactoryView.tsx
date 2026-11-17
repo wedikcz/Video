@@ -37,6 +37,7 @@ import {
   LayoutGrid,
   List,
   Eye,
+  Wand2,
 } from 'lucide-react';
 import {
   FactoryAsset,
@@ -63,6 +64,7 @@ import { StructuredPromptBuilder } from './StructuredPromptBuilder.tsx';
 import { MonetizationCheatsheetsPanel } from './MonetizationCheatsheetsPanel.tsx';
 import { AssetReviewModal } from './AssetReviewModal.tsx';
 import { BatchQueuePanel } from './BatchQueuePanel.tsx';
+import { VideoFactoryPanel } from './VideoFactoryPanel.tsx';
 import {
   CAMERA_MOTION_LABELS,
   LIGHTING_LABELS,
@@ -171,7 +173,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // OpenGen.ai/cs & Local Zero-API Structured Text-to-Video State
-  const [studioMode, setStudioMode] = useState<'opengen' | 'moviepy'>('opengen');
+  const [studioMode, setStudioMode] = useState<'opengen' | 'moviepy' | 'titancore'>('opengen');
   const [openGenModels, setOpenGenModels] = useState<OpenGenModelSpec[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>('nexus-local-director');
   const [openGenMode, setOpenGenMode] = useState<'text_to_video' | 'image_to_video' | 'video_to_video'>('text_to_video');
@@ -1470,7 +1472,7 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
 
         <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
           {/* Studio Mode Switcher */}
-          <div className="flex items-center rounded-lg border border-zinc-800 bg-zinc-900 p-1">
+          <div className="flex flex-wrap items-center rounded-lg border border-zinc-800 bg-zinc-900 p-1">
             <button
               type="button"
               onClick={() => setStudioMode('opengen')}
@@ -1494,6 +1496,19 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
             >
               <Film className="h-3.5 w-3.5" />
               <span>MoviePy Scénáře</span>
+            </button>
+            <button
+              type="button"
+              data-testid="studio-mode-titancore-btn"
+              onClick={() => setStudioMode('titancore')}
+              className={`flex items-center gap-1.5 rounded px-3 py-1 font-bold whitespace-nowrap transition ${
+                studioMode === 'titancore'
+                  ? 'bg-amber-400 text-black shadow-md'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+            >
+              <Wand2 className="h-3.5 w-3.5" />
+              <span>TitanCore YPP</span>
             </button>
           </div>
 
@@ -1604,6 +1619,16 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           <ShieldAlert className="h-4 w-4 shrink-0 text-rose-400" />
           <span>{errorMsg}</span>
         </div>
+      )}
+
+      {/* GODMODE-TITANCORE MADLIPZ CZ YPP STUDIO */}
+      {studioMode === 'titancore' && (
+        <VideoFactoryPanel
+          assets={assets}
+          onRefreshAssets={onRefreshAssets}
+          currentActor={currentActor}
+          onOpenPublish={onOpenPublish}
+        />
       )}
 
       {/* OPENGEN MULTI-MODEL HUB (when studioMode === 'opengen') */}
@@ -2177,6 +2202,8 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
       )}
 
       {/* SmartVideoOrchestrator: Trend Analysis & Autonomous MoviePy + FFmpeg (+faststart) Pipeline */}
+      {studioMode !== 'titancore' && (
+      <>
       <div
         className="rounded-lg border border-cyan-500/30 bg-zinc-900/70 p-4 space-y-3 font-mono text-xs"
         data-testid="smart-video-orchestrator"
@@ -2893,6 +2920,8 @@ export const FactoryView: React.FC<FactoryViewProps> = ({
           )}
         </div>
       </div>
+      </>
+      )}
 
       {/* CREATE / CUSTOMIZE TEMPLATE MODAL */}
       {isTemplateModalOpen && (

@@ -27,8 +27,15 @@ import {
   SocialComment,
   CommentAutopilotConfig,
   CommentSwarmKpis,
+  FalInferenceRun,
+  ServerlessEndpoint,
+  ComputeGpuInstance,
+  InfraWorkflowRun,
+  LoraTrainingJob,
 } from '../types/nexus.ts';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { getDefaultPermissionsForRole } from './runtime/rbac.ts';
 import { deriveContentRecommendations } from './runtime/analyticsInsights.ts';
 import { MoviePyCompiler } from './runtime/moviepy.ts';
@@ -78,12 +85,154 @@ class NexusDatabase {
   };
   public comments: SocialComment[] = [];
   public commentAutopilotConfig: CommentAutopilotConfig = { ...DEFAULT_COMMENT_AUTOPILOT_CONFIG };
+  public falInferenceRuns: FalInferenceRun[] = [];
+  public serverlessEndpoints: ServerlessEndpoint[] = [];
+  public computeGpuInstances: ComputeGpuInstance[] = [];
+  public infraWorkflowRuns: InfraWorkflowRun[] = [];
+  public loraTrainingJobs: LoraTrainingJob[] = [];
   private lastCpuSample: { idle: number; total: number } | null = null;
   private lastPerfTickAt: number = Date.now();
   private lastLoopLagMs: number = 1.2;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.seed();
+    this.loadPersistedState();
+  }
+
+  private getStateFilePath(): string | null {
+    if (process.env.NEXUS_STATE_FILE && process.env.NEXUS_STATE_FILE.trim()) {
+      return path.resolve(process.cwd(), process.env.NEXUS_STATE_FILE.trim());
+    }
+    const isTestEnv =
+      process.env.NODE_ENV === 'test' ||
+      process.env.NEXUS_SKIP_LISTEN === '1' ||
+      Boolean(process.env.NODE_TEST_CONTEXT) ||
+      process.execArgv.some((arg) => arg.includes('test')) ||
+      process.argv.some((arg) => arg === '--test' || arg.includes('.test.'));
+    if (isTestEnv) return null;
+    return path.resolve(process.cwd(), 'data', 'nexus-state.json');
+  }
+
+  public exportSnapshot(): Record<string, any> {
+    return {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      isSystemPaused: this.isSystemPaused,
+      isAutonomousRevenueLoopActive: this.isAutonomousRevenueLoopActive,
+      totalCzkBudgetSpent: this.totalCzkBudgetSpent,
+      dailyCzkBudgetLimit: this.dailyCzkBudgetLimit,
+      activeAccountId: this.activeAccountId,
+      currentActorId: this.currentActorId,
+      agents: this.agents,
+      opportunities: this.opportunities,
+      activities: this.activities.slice(0, 200),
+      memories: this.memories.slice(0, 400),
+      threads: this.threads.slice(0, 100),
+      messages: Array.from(this.messages.entries()),
+      boardroomSessions: this.boardroomSessions.slice(0, 50),
+      factoryAssets: this.factoryAssets.slice(0, 200),
+      runs: Array.from(this.runs.entries()).slice(-150),
+      socialIntegrations: this.socialIntegrations,
+      publishTasks: this.publishTasks.slice(0, 100),
+      userTemplates: this.userTemplates,
+      accounts: this.accounts,
+      teamMembers: this.teamMembers,
+      openGenCredits: this.openGenCredits,
+      comments: this.comments.slice(0, 300),
+      commentAutopilotConfig: this.commentAutopilotConfig,
+      falInferenceRuns: this.falInferenceRuns.slice(0, 100),
+      serverlessEndpoints: this.serverlessEndpoints.slice(0, 100),
+      computeGpuInstances: this.computeGpuInstances.slice(0, 100),
+      infraWorkflowRuns: this.infraWorkflowRuns.slice(0, 100),
+      loraTrainingJobs: this.loraTrainingJobs.slice(0, 100),
+    };
+  }
+
+  public importSnapshot(snapshot: Record<string, any>): void {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    if (typeof snapshot.isSystemPaused === 'boolean') this.isSystemPaused = snapshot.isSystemPaused;
+    if (typeof snapshot.isAutonomousRevenueLoopActive === 'boolean') {
+      this.isAutonomousRevenueLoopActive = snapshot.isAutonomousRevenueLoopActive;
+    }
+    if (typeof snapshot.totalCzkBudgetSpent === 'number') this.totalCzkBudgetSpent = snapshot.totalCzkBudgetSpent;
+    if (typeof snapshot.dailyCzkBudgetLimit === 'number') this.dailyCzkBudgetLimit = snapshot.dailyCzkBudgetLimit;
+    if (typeof snapshot.activeAccountId === 'string') this.activeAccountId = snapshot.activeAccountId;
+    if (typeof snapshot.currentActorId === 'string') this.currentActorId = snapshot.currentActorId;
+    if (Array.isArray(snapshot.agents) && snapshot.agents.length > 0) this.agents = snapshot.agents;
+    if (Array.isArray(snapshot.opportunities)) this.opportunities = snapshot.opportunities;
+    if (Array.isArray(snapshot.activities)) this.activities = snapshot.activities;
+    if (Array.isArray(snapshot.memories)) this.memories = snapshot.memories;
+    if (Array.isArray(snapshot.threads)) this.threads = snapshot.threads;
+    if (Array.isArray(snapshot.messages)) this.messages = new Map(snapshot.messages);
+    if (Array.isArray(snapshot.boardroomSessions)) this.boardroomSessions = snapshot.boardroomSessions;
+    if (Array.isArray(snapshot.factoryAssets)) {
+      this.factoryAssets = snapshot.factoryAssets.map((a: FactoryAsset) =>
+        a.status === 'rendering'
+          ? {
+              ...a,
+              status: fs.existsSync(a.filePath || '') ? 'ready' : 'failed',
+              renderStatus: fs.existsSync(a.filePath || '') ? 'ready' : 'failed',
+            }
+          : a
+      );
+    }
+    if (Array.isArray(snapshot.runs)) this.runs = new Map(snapshot.runs);
+    if (Array.isArray(snapshot.socialIntegrations)) this.socialIntegrations = snapshot.socialIntegrations;
+    if (Array.isArray(snapshot.publishTasks)) this.publishTasks = snapshot.publishTasks;
+    if (Array.isArray(snapshot.userTemplates)) this.userTemplates = snapshot.userTemplates;
+    if (Array.isArray(snapshot.accounts)) this.accounts = snapshot.accounts;
+    if (Array.isArray(snapshot.teamMembers)) this.teamMembers = snapshot.teamMembers;
+    if (snapshot.openGenCredits && typeof snapshot.openGenCredits === 'object') {
+      this.openGenCredits = snapshot.openGenCredits;
+    }
+    if (Array.isArray(snapshot.comments)) this.comments = snapshot.comments;
+    if (snapshot.commentAutopilotConfig && typeof snapshot.commentAutopilotConfig === 'object') {
+      this.commentAutopilotConfig = snapshot.commentAutopilotConfig;
+    }
+    if (Array.isArray(snapshot.falInferenceRuns)) this.falInferenceRuns = snapshot.falInferenceRuns;
+    if (Array.isArray(snapshot.serverlessEndpoints)) this.serverlessEndpoints = snapshot.serverlessEndpoints;
+    if (Array.isArray(snapshot.computeGpuInstances)) this.computeGpuInstances = snapshot.computeGpuInstances;
+    if (Array.isArray(snapshot.infraWorkflowRuns)) this.infraWorkflowRuns = snapshot.infraWorkflowRuns;
+    if (Array.isArray(snapshot.loraTrainingJobs)) this.loraTrainingJobs = snapshot.loraTrainingJobs;
+  }
+
+  public loadPersistedState(): boolean {
+    const filePath = this.getStateFilePath();
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const parsed = JSON.parse(raw) as Record<string, any>;
+      this.importSnapshot(parsed);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public persistSync(): boolean {
+    const filePath = this.getStateFilePath();
+    if (!filePath) return false;
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      const tmpPath = `${filePath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(this.exportSnapshot()), 'utf-8');
+      fs.renameSync(tmpPath, filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public schedulePersist(delayMs = 250): void {
+    const filePath = this.getStateFilePath();
+    if (!filePath) return;
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.persistSync();
+    }, delayMs);
+    this.persistTimer.unref?.();
   }
 
   public getCurrentActor(): TeamMember | undefined {
@@ -1339,6 +1488,92 @@ class NexusDatabase {
         multiCoreAnalysis: analysis,
       };
     });
+
+    // Seed Fal Media Infrastructure Layer (Serverless, Compute GPU, LoRA Training)
+    const nowIso = new Date().toISOString();
+    this.serverlessEndpoints = [
+      {
+        id: 'ep-madlipz-lora',
+        name: 'madlipz-cz-flux3-lora',
+        slug: 'madlipz-cz-flux3-lora',
+        endpointUrl: 'https://fal.run/nexus-private/madlipz-cz-flux3-lora',
+        baseModel: 'fal-ai/flux-3/pro',
+        weightsSourceUrl: 's3://nexus-weights/madlipz-cz-v2.safetensors',
+        visibility: 'private',
+        authTokenMasked: 'fal_key_live_••••9a4c',
+        gpuProfile: 'h100-sxm',
+        minReplicas: 1,
+        maxReplicas: 12,
+        scaleToZeroSec: 120,
+        coldStartMs: 390,
+        status: 'ready',
+        requestsCount: 184,
+        avgLatencyMs: 510,
+        createdAt: new Date(Date.now() - 86400000 * 3).toISOString(),
+        updatedAt: nowIso,
+      },
+      {
+        id: 'ep-fintech-h3',
+        name: 'fintech-cinema-h3-max',
+        slug: 'fintech-cinema-h3-max',
+        endpointUrl: 'https://fal.run/nexus-private/fintech-cinema-h3-max',
+        baseModel: 'fal-ai/h3-max',
+        weightsSourceUrl: 'hf://wedikcz/fintech-h3-lora-weights',
+        visibility: 'team',
+        authTokenMasked: 'fal_key_live_••••3f18',
+        gpuProfile: 'h200-sxm',
+        minReplicas: 0,
+        maxReplicas: 8,
+        scaleToZeroSec: 90,
+        coldStartMs: 340,
+        status: 'scaled_to_zero',
+        requestsCount: 47,
+        avgLatencyMs: 1890,
+        createdAt: new Date(Date.now() - 86400000).toISOString(),
+        updatedAt: nowIso,
+      },
+    ];
+
+    this.computeGpuInstances = [
+      {
+        id: 'gpu-prague-h100-01',
+        name: 'H100-2x-prague-prod',
+        gpuId: 'h100-sxm',
+        gpuName: 'NVIDIA H100 SXM5',
+        gpuCount: 2,
+        totalVramGb: 160,
+        region: 'eu-central-prague',
+        workload: 'inference',
+        hourlyCostUsd: 4.98,
+        status: 'running',
+        utilizationPercent: 68,
+        vramUsedGb: 94,
+        sshEndpoint: 'ssh root@gpu-prague-h100-01.eu-central-prague.compute.nexus-fal.internal -p 2222',
+        apiEndpoint: 'https://gpu-prague-h100-01.eu-central-prague.compute.nexus-fal.internal/v1',
+        createdAt: new Date(Date.now() - 3600000 * 6).toISOString(),
+      },
+    ];
+
+    this.loraTrainingJobs = [
+      {
+        id: 'lora-brand-v1',
+        adapterName: 'Kancelář CZ Brand LoRA',
+        baseModelId: 'fal-ai/flux-3/pro',
+        triggerWord: 'KANCELARCZ',
+        datasetSource: 's3://nexus-datasets/kancelar-cz-frames-32.zip',
+        gpuTier: 'b200-hgx',
+        rank: 32,
+        steps: 1200,
+        completedSteps: 1200,
+        learningRate: 0.0002,
+        currentLoss: 0.058,
+        lossHistory: [0.43, 0.295, 0.198, 0.128, 0.084, 0.058],
+        status: 'completed',
+        weightsArtifactUrl: 's3://nexus-weights/kancelar-cz-lora-v1.safetensors',
+        deployedEndpointId: 'ep-madlipz-lora',
+        createdAt: new Date(Date.now() - 3600000 * 14).toISOString(),
+      },
+    ];
   }
 
   public getCommentSwarmKpis(): CommentSwarmKpis {

@@ -19,6 +19,7 @@ import {
   MultiGenArtifactType,
   SelfHealingEvent,
 } from '../types/nexus.ts';
+import { generateAndroidKeystore, androidKeystoreMcpToolDefinition } from '../tools/androidKeystoreTool.ts';
 
 const MAX_MCP_OUTPUT_CHARS = 8000;
 
@@ -846,6 +847,7 @@ export const HUB_MCP_TOOLS = [
     description: 'Vrátí stav binárek, event loopu, CPU, paměti, Media Vaultu a posledních self-healing oprav.',
     inputSchema: { type: 'object', properties: {} },
   },
+  androidKeystoreMcpToolDefinition,
 ];
 
 export const HUB_MCP_RESOURCES = [
@@ -1024,6 +1026,14 @@ export async function handleMcpJsonRpc(rpcRequest: {
           endpointsActive: db.mcpEndpoints.length,
           mediaVaultVideos: db.factoryAssets.filter((a) => a.line === 'video').length,
         };
+      } else if (toolName === 'generate_android_keystore') {
+        rawResult = await generateAndroidKeystore({
+          alias: String(args.alias || 'nexus-key'),
+          keyPassword: String(args.keyPassword || 'nexus-key-pass'),
+          storePassword: String(args.storePassword || 'nexus-store-pass'),
+          fileName: args.fileName ? String(args.fileName) : undefined,
+          validityYears: args.validityYears ? Number(args.validityYears) : 25,
+        });
       } else {
         throw new Error(`Neznámý MCP tool "${toolName}".`);
       }

@@ -49,6 +49,8 @@ import {
 } from '../types/nexus.ts';
 import { downloadVideoAsset, formatBytes, formatDuration } from '../utils/mediaDownload.ts';
 import { getModelAvatar, DEFAULT_AVATAR_PROMPTS } from '../utils/modelAvatars.ts';
+import { ModelAvatarView } from './ModelAvatarView.tsx';
+import { generateModelAvatar } from '../services/avatarService.ts';
 
 interface ChatOSProps {
   onOpenTrace: (trace: RunTrace) => void;
@@ -1294,10 +1296,7 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                 Model:
               </span>
               {chatModels.map((model) => {
-                const avatar = getModelAvatar(model.id, customAvatars[model.id]);
                 const isSelected = selectedModelId === model.id;
-                const imgBroken = Boolean(failedAvatars[model.id]);
-                const isGenerating = Boolean(isGeneratingAvatar[model.id]);
                 return (
                   <div
                     key={model.id}
@@ -1311,114 +1310,49 @@ export const ChatOS: React.FC<ChatOSProps> = ({
                         setSelectedModelId(model.id);
                       }
                     }}
-                    className={`group relative flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left font-mono transition shrink-0 cursor-pointer ${
-                      isSelected
-                        ? `bg-gradient-to-r ${avatar.accentClass} text-white shadow-sm`
-                        : 'border-zinc-800 bg-zinc-950/80 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                    className={`cursor-pointer transition-all ${
+                      isSelected ? 'ring-2 ring-emerald-400 rounded-lg' : 'opacity-85 hover:opacity-100'
                     }`}
                   >
-                    <div
-                      className="relative shrink-0 cursor-pointer"
-                      title={
-                        avatar.imageUrl
-                          ? `Kliknutím otevřete detail avatara ${model.name}`
-                          : undefined
-                      }
-                      onClick={(e) => {
-                        if (avatar.imageUrl) {
-                          e.stopPropagation();
-                          setAvatarModal({
-                            modelId: model.id,
-                            modelName: model.name,
-                            avatarUrl: avatar.imageUrl,
-                            prompt:
-                              DEFAULT_AVATAR_PROMPTS[model.id] ||
-                              `Futuristický kybernetický avatar pro model ${model.name}`,
-                          });
-                        }
+                    <ModelAvatarView
+                      modelId={model.id}
+                      modelName={model.name}
+                      customAvatarUrl={customAvatars[model.id]}
+                      onAvatarUpdated={(mid, newUrl) => {
+                        setCustomAvatars((prev) => ({ ...prev, [mid]: newUrl }));
                       }}
-                    >
-                      {avatar.imageUrl && !imgBroken ? (
-                        <img
-                          src={avatar.imageUrl}
-                          alt={`${model.name} futuristický avatar`}
-                          referrerPolicy="no-referrer"
-                          onError={() =>
-                            setFailedAvatars((prev) => ({ ...prev, [model.id]: true }))
-                          }
-                          className="h-7 w-7 rounded object-cover border border-white/20 shrink-0 bg-zinc-900 group-hover:border-cyan-400 transition"
-                        />
-                      ) : (
-                        <div className="flex h-7 w-7 items-center justify-center rounded border border-zinc-700 bg-zinc-900 text-[9px] font-bold text-emerald-400 shrink-0">
-                          {avatar.shortTag.slice(0, 3)}
-                        </div>
-                      )}
-
-                      {/* Generating Spinner Overlay */}
-                      {isGenerating && (
-                        <div className="absolute inset-0 flex items-center justify-center rounded bg-black/80">
-                          <RefreshCw className="h-3 w-3 animate-spin text-cyan-300" />
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="leading-tight">
-                      <div className="text-[11px] font-bold whitespace-nowrap flex items-center gap-1">
-                        <span>{model.name}</span>
-                        {customAvatars[model.id] && (
-                          <span className="rounded bg-cyan-500/20 text-cyan-300 text-[8px] px-1 py-0 border border-cyan-500/40">
-                            AI GEN
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[9px] text-zinc-400 whitespace-nowrap">
-                        {model.badge || avatar.shortTag} · {model.provider || 'AI Engine'}
-                      </div>
-                    </div>
-
-                    {/* Quick Trigger Button for WAN-2.2 and LTX-2.5 */}
-                    {(model.id === 'wan-2-2' || model.id === 'ltx-2-5') && (
-                      <button
-                        type="button"
-                        data-testid={`generate-avatar-btn-${model.id}`}
-                        title={`Vygenerovat nový avatar přes Media Toolkit (${model.name})`}
-                        disabled={isGenerating}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleGenerateAvatar(model.id);
-                        }}
-                        className="ml-1 rounded p-1 text-zinc-400 hover:bg-cyan-500/20 hover:text-cyan-300 transition"
-                      >
-                        {isGenerating ? (
-                          <RefreshCw className="h-3 w-3 animate-spin text-cyan-400" />
-                        ) : (
-                          <Sparkles className="h-3 w-3 text-cyan-400" />
-                        )}
-                      </button>
-                    )}
+                      onInspectAvatar={(mid, mname, url) => {
+                        setAvatarModal({
+                          modelId: mid,
+                          modelName: mname,
+                          avatarUrl: url,
+                          prompt: DEFAULT_AVATAR_PROMPTS[mid] || `Futuristický kybernetický avatar pro ${mname}`,
+                        });
+                      }}
+                    />
                   </div>
                 );
               })}
 
-              {/* Dedicated Avatar Generator Action for selected model */}
+              {/* Dedicated Avatar Generator Action for WAN-2.2 and LTX-2.5 */}
               {(selectedModelId === 'wan-2-2' || selectedModelId === 'ltx-2-5') && (
                 <button
                   type="button"
                   data-testid="interactive-generate-avatar-btn"
                   disabled={isGeneratingAvatar[selectedModelId]}
                   onClick={() => handleGenerateAvatar(selectedModelId)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-gradient-to-r from-cyan-500/15 to-violet-500/15 hover:from-cyan-500/25 hover:to-violet-500/25 px-2.5 py-1.5 font-mono text-[11px] font-semibold text-cyan-200 hover:text-white shrink-0 transition"
-                  title="Spustí Media Generation Toolkit API pro vygenerování nového futuristického avatara"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-gradient-to-r from-cyan-500/15 to-violet-500/15 hover:from-cyan-500/25 hover:to-violet-500/25 px-3 py-2 font-mono text-[11px] font-semibold text-cyan-200 hover:text-white shrink-0 transition shadow-sm"
+                  title="Re-invoke local media toolkit to regenerate 3D portrait avatar"
                 >
                   {isGeneratingAvatar[selectedModelId] ? (
                     <>
-                      <RefreshCw className="h-3 w-3 animate-spin text-cyan-300" />
-                      <span>Generuji avatar...</span>
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin text-cyan-300" />
+                      <span>Generuji 3D avatar...</span>
                     </>
                   ) : (
                     <>
-                      <Sparkles className="h-3 w-3 text-cyan-300" />
-                      <span>Generovat avatar ({selectedModelId.toUpperCase()})</span>
+                      <Sparkles className="h-3.5 w-3.5 text-cyan-300" />
+                      <span>Aktualizovat avatar ({selectedModelId.toUpperCase()})</span>
                     </>
                   )}
                 </button>
